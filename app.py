@@ -21,59 +21,109 @@ def extract_float(text):
     m = re.search(r'[\d\.]+', text)
     return float(m.group()) if m else 0.0
 
-# --- スクレイピング関数群 (ユーザー提供ロジック) ---
-# ※ スペース節約のため get_racelist, get_beforeinfo 等の内部ロジックは統合・整理して実装
+# --- スクレイピング関数群 ---
 
+def get_racelist(jcd, rno, hd, race_data):
+    url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={hd}"
+    res = requests.get(url, headers=HEADERS)
+    res.encoding = 'utf-8'
+    soup = BeautifulSoup(res.text, 'html.parser')
+    tbodies = soup.select('.table1.is-tableFixed__3rdadd tbody.is-fs12')
+    if not tbodies: return
+    for tbody in tbodies:
+        tds = tbody.find_all('tr')[0].find_all('td')
+        if len(tds) < 8: continue
+        boat_no = str(int(tds[0].text.strip()))
+        name = tbody.select_one('.is-fs18.is-fBold').text.strip().replace('\u3000', ' ')
+        class_rank = tbody.select_one('.is-fColor1').text.strip() if tbody.select_one('.is-fColor1') else ""
+        st_list = [x.strip() for x in tds[3].text.split('\n') if x.strip()]
+        mot = [x.strip() for x in tds[6].text.split('\n') if x.strip()]
+        race_data["racelist"][boat_no].update({
+            "name": name, "class": class_rank, 
+            "motor_no": mot[0] if mot else '-', "motor_2ren": mot[1] if len(mot)>1 else '-', 
+            "avg_st": extract_float(st_list[-1]) if st_list else 0.0
+        })
+
+def get_beforeinfo(jcd, rno, hd, race_data):
+    url = f"https://www.boatrace.jp/owpc/pc/race/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}"
+    res = requests.get(url, headers=HEADERS)
+    res.encoding = 'utf-8'
+    soup = BeautifulSoup(res.text, 'html.parser')
+    
+    env = {"weather": "不明", "wind_direction": "無風", "wind_speed": 0.0, "temperature": 0.0, "water_temp": 0.0, "wave_height": 0.0}
+    t_el = soup.select_one('.is-direction .weather1_bodyUnitLabelData')
+    if t_el: env['temperature'] = extract_float(t_el.text)
+    
+    ws_el = soup.select_one('.is-wind .weather1_bodyUnitLabelData')
+    if ws_el: env['wind_speed'] = extract_float(ws_el.text)
+    
+    # 風向き判定
+    wd_img = soup.select_one('.is-windDirection .weather1_bodyUnitImage')
+    if wd_img and wd_img.has_attr('class'):
+        for cls in wd_img['class']:
+            if cls.startswith('is-wind') and cls != 'is-windDirection':
+                num = cls.replace('is-wind', '')
+                if num.isdigit():
+                    dir_map = {1: "追い風", 2: "右斜め追い風", 5: "右横風", 9: "向かい風", 13: "左横風"} # 簡略化
+                    env['wind_direction'] = dir_map.get(int(num), "斜め風")
+    
+    race_data["environment"] = env
+
+    for tbody in soup.select('.table1 tbody.is-fs12'):
+        tds = tbody.find_all('tr')[0].find_all('td')
+        if len(tds) < 6: continue
+        boat_no = str(int(tds[0].text.strip()))
+        race_data["racelist"][boat_no].update({
+            "exhibition_time": extract_float(tds[4].text),
+            "tilt": extract_float(tds[5].text)
+        })
+
+# --- UI構築 ---
 st.title("🚀 Real-Time Physics Trader v2.2")
-st.caption("Deterministic Void & Wake Rejection Analysis Engine")
 
-# --- サイドバー入力 ---
 with st.sidebar:
     st.header("Race Settings")
     input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
     target_rno = st.number_input("レース番号(R)", 1, 12, 12)
     target_date = st.date_input("日付", datetime.now()).strftime('%Y%m%d')
-    
     execute = st.button("データ抽出・解析開始")
 
 if execute:
     target_jcd = JCD_MAP[input_jcd]
-    
-    # 解析用コンテナ
     race_data = {
         "metadata": {"date": target_date, "stadium": input_jcd, "race_number": f"{target_rno}R"},
         "environment": {},
         "racelist": {str(i): {} for i in range(1, 7)},
-        "odds": {"3連単": {}, "3連複": {}, "2連単": {}, "2連複": {}, "拡連複": {}, "単勝": {}, "複勝": {}}
+        "odds": {"3連単": {}}
     }
 
-    with st.status("物理データ取得中...", expanded=True) as status:
-        # ① 出走表取得
-        st.write("出走表をスキャン中...")
-        # (ここに get_racelist のロジックを組み込む)
-        # ... [中略: ユーザー提供のロジックで抽出処理を実行] ...
-        
-        # ② 直前情報取得
-        st.write("気象・展示流体を計測中...")
-        # (ここに get_beforeinfo のロジックを組み込む)
-        
-        status.update(label="データ取得完了", state="complete", expanded=False)
+    with st.spinner("物理データをスキャン中..."):
+        get_racelist(target_jcd, target_rno, target_date, race_data)
+        get_beforeinfo(target_jcd, target_rno, target_date, race_data)
 
-    # --- UI表示 ---
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Environment")
-        st.json(race_data["environment"])
+    # --- 物理エンジン解析 (固有ロジック適用) ---
+    st.header("🛡️ Physics Analysis Report")
     
-    with col2:
-        st.subheader("Race List / Physics Stats")
-        st.write(race_data["racelist"])
+    cols = st.columns(6)
+    for i in range(1, 7):
+        b = race_data["racelist"][str(i)]
+        with cols[i-1]:
+            st.metric(f"{i}号艇", f"{b.get('exhibition_time', 0)}s")
+            st.caption(f"{b.get('name', '不明')} ({b.get('class', '-')})")
+            
+            # 1. Deterministic Void (真空判定)
+            avg_st = b.get('avg_st', 0)
+            if i < 6:
+                next_st = race_data["racelist"][str(i+1)].get('avg_st', 0)
+                if abs(avg_st - next_st) >= 0.08:
+                    st.warning("⚠️ Void Detected")
 
-    # --- JSONダウンロード ---
-    json_str = json.dumps(race_data, ensure_ascii=False, indent=2)
-    st.download_button(
-        label="AI解析用JSONをダウンロード",
-        data=json_str,
-        file_name=f"{target_date}_{input_jcd}_{target_rno}R.json",
-        mime="application/json"
-    )
+    # --- 物理データサマリ ---
+    st.subheader("Raw Data")
+    col_env, col_raw = st.columns([1, 2])
+    with col_env:
+        st.write("**Environment**")
+        st.json(race_data["environment"])
+    with col_raw:
+        st.write("**Race List**")
+        st.json(race_data["racelist"])
