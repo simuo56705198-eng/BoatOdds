@@ -34,10 +34,15 @@ def get_racelist(jcd, rno, hd, race_data):
         b_no = str(int(tds[0].text.strip()))
         name = tbody.select_one('.is-fs18.is-fBold').text.strip().replace('\u3000', ' ')
         rank = tbody.select_one('.is-fColor1').text.strip() if tbody.select_one('.is-fColor1') else ""
+        
+        # 体重データの抽出
+        weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
+        weight = float(weight_match.group(1)) if weight_match else 0.0
+
         st_txt = [x.strip() for x in tds[3].text.split('\n') if x.strip()]
         mot = [x.strip() for x in tds[6].text.split('\n') if x.strip()]
         race_data["racelist"][b_no].update({
-            "name": name, "class": rank, "motor_no": mot[0] if mot else '-',
+            "name": name, "class": rank, "weight": weight, "motor_no": mot[0] if mot else '-',
             "motor_2ren": mot[1] if len(mot)>1 else '-', "avg_st": extract_float(st_txt[-1]) if st_txt else 0.0
         })
 
@@ -76,7 +81,6 @@ def get_beforeinfo(jcd, rno, hd, race_data):
             })
 
 def fetch_all_odds(jcd, rno, hd, race_data):
-    # 3連単・3連複 / 2連単・2連複
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
         res = requests.get(f"https://www.boatrace.jp/owpc/pc/race/{otype}?rno={rno}&jcd={jcd}&hd={hd}")
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -110,7 +114,6 @@ def fetch_all_odds(jcd, rno, hd, race_data):
                             if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                                 race_data["odds"][k][f"{c+1}{s}{tds[c*2].text.strip()}"] = extract_float(tds[c*2+1].text)
 
-    # 拡連複 (ワイド)
     resk = requests.get(f"https://www.boatrace.jp/owpc/pc/race/oddsk?rno={rno}&jcd={jcd}&hd={hd}")
     tbk = BeautifulSoup(resk.text, 'html.parser').select_one('tbody.is-p3-0')
     if tbk:
@@ -157,7 +160,7 @@ if execute:
         b = race_data["racelist"][str(i)]
         with cols[i-1]:
             st.metric(f"{i}号艇", f"{b.get('exhibition_time', 0)}s")
-            st.caption(f"{b.get('name')} ({b.get('class')})")
+            st.caption(f"{b.get('name')} ({b.get('class')}) / {b.get('weight', 0.0)}kg")
             
             # 真空判定 (Deterministic Void)
             if i < 6:
@@ -174,7 +177,7 @@ if execute:
     st.subheader("Raw AI Data")
     st.json(race_data)
 
-    # JSONダウンロードボタン (再実装)
+    # JSONダウンロードボタン
     json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
     st.download_button(
         label="📥 AI解析用JSONをダウンロード",
