@@ -27,22 +27,49 @@ def get_racelist(jcd, rno, hd, race_data):
     url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={hd}"
     res = requests.get(url, headers=HEADERS); res.encoding = 'utf-8'
     soup = BeautifulSoup(res.text, 'html.parser')
+    
+    # 出走表テーブルの各行を解析
     tbodies = soup.select('.table1.is-tableFixed__3rdadd tbody.is-fs12')
     for tbody in tbodies:
         tds = tbody.find_all('tr')[0].find_all('td')
-        if len(tds) < 8: continue
-        b_no = str(int(tds[0].text.strip()))
-        name = tbody.select_one('.is-fs18.is-fBold').text.strip().replace('\u3000', ' ')
-        rank = tbody.select_one('.is-fColor1').text.strip() if tbody.select_one('.is-fColor1') else ""
+        if len(tds) < 3: continue
         
+        # 艇番の取得 (全角数字にも対応)
+        b_no_raw = tds[0].text.strip()
+        b_no_match = re.search(r'[1-6１-６]', b_no_raw)
+        if not b_no_match: continue
+        # 全角を半角に変換して数値化
+        b_no = str(int(b_no_match.group().translate(str.maketrans('１２３４５６', '123456'))))
+
+        # 級別（クラス）の取得ロジック修正
+        # クラス情報が入っている div (is-fs11) 内の span を取得
+        class_info_div = tbody.select_one('div.is-fs11')
+        rank = ""
+        if class_info_div:
+            rank_span = class_info_div.select_one('span')
+            if rank_span:
+                rank = rank_span.text.strip()
+
+        # 名前
+        name = tbody.select_one('.is-fs18.is-fBold').text.strip().replace('\u3000', ' ')
+        
+        # 体重 (td[2] に登録番号/級別/氏名/出身地/年齢/体重がまとまっている)
         weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
         weight = float(weight_match.group(1)) if weight_match else 0.0
 
+        # 平均ST (td[3] の最後の一行)
         st_txt = [x.strip() for x in tds[3].text.split('\n') if x.strip()]
+        
+        # モーター番号と2連率 (td[6])
         mot = [x.strip() for x in tds[6].text.split('\n') if x.strip()]
+        
         race_data["racelist"][b_no].update({
-            "name": name, "class": rank, "weight": weight, "motor_no": mot[0] if mot else '-',
-            "motor_2ren": mot[1] if len(mot)>1 else '-', "avg_st": extract_float(st_txt[-1]) if st_txt else 0.0
+            "name": name, 
+            "class": rank, 
+            "weight": weight, 
+            "motor_no": mot[0] if mot else '-',
+            "motor_2ren": mot[1] if len(mot)>1 else '-', 
+            "avg_st": extract_float(st_txt[-1]) if st_txt else 0.0
         })
 
 def get_beforeinfo(jcd, rno, hd, race_data):
@@ -51,7 +78,7 @@ def get_beforeinfo(jcd, rno, hd, race_data):
     soup = BeautifulSoup(res.text, 'html.parser')
     env = race_data["environment"]
     
-    # 水面気象
+    # 水面気象情報の抽出
     t_el = soup.select_one('.is-direction .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
@@ -79,26 +106,27 @@ def get_beforeinfo(jcd, rno, hd, race_data):
         if len(tds) >= 6:
             b_no = str(int(tds[0].text.strip()))
             race_data["racelist"][b_no].update({
-                "exhibition_time": extract_float(tds[4].text), "tilt": extract_float(tds[5].text)
+                "exhibition_time": extract_float(tds[4].text), 
+                "tilt": extract_float(tds[5].text)
             })
 
-    # --- スタート展示ロジック (追加) ---
-    # HTMLの進入コース順に配置されている div.table1_boatImage1 を解析
+    # スタート展示の解析
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
         b_no_el = div.select_one('.table1_boatImage1Number')
         st_time_el = div.select_one('.table1_boatImage1Time')
         if b_no_el and st_time_el:
-            # 艇番とST、進入コースを格納
-            b_no = str(int(re.search(r'\d+', b_no_el.text).group()))
-            st_val = st_time_el.text.strip()
-            race_data["racelist"][b_no].update({
-                "start_course": course_idx,
-                "start_exhibition_st": st_val
-            })
+            b_no_match = re.search(r'\d+', b_no_el.text)
+            if b_no_match:
+                b_no = b_no_match.group()
+                st_val = st_time_el.text.strip()
+                race_data["racelist"][b_no].update({
+                    "start_course": course_idx,
+                    "start_exhibition_st": st_val
+                })
 
 def fetch_all_odds(jcd, rno, hd, race_data):
-    # 連番系オッズ
+    # 連番系オッズ (3連単, 3連複, 2連単, 2連複)
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
         res = requests.get(f"https://www.boatrace.jp/owpc/pc/race/{otype}?rno={rno}&jcd={jcd}&hd={hd}")
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -142,18 +170,16 @@ def fetch_all_odds(jcd, rno, hd, race_data):
                 if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                     race_data["odds"]["拡連複"][f"{c+1}={tds[c*2].text.strip()}"] = tds[c*2+1].text.strip()
 
-    # --- 単勝・複勝ロジック (修正) ---
+    # 単勝・複勝
     res_tf = requests.get(f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd}&hd={hd}")
     soup_tf = BeautifulSoup(res_tf.text, 'html.parser')
     
-    # ページ内の grid_unit をループして「単勝」と「複勝」のテーブルを判別
     for unit in soup_tf.select('.grid_unit'):
-        label = unit.select_one('.title7_mainLabel')
-        if not label: continue
+        label_el = unit.select_one('.title7_mainLabel')
+        if not label_el: continue
         
-        mode = None
-        if "単勝" in label.text: mode = "単勝"
-        elif "複勝" in label.text: mode = "複勝"
+        label_text = label_el.text
+        mode = "単勝" if "単勝" in label_text else "複勝" if "複勝" in label_text else None
         if not mode: continue
         
         for tr in unit.select('table tbody tr'):
@@ -165,7 +191,7 @@ def fetch_all_odds(jcd, rno, hd, race_data):
                 if mode == "単勝":
                     race_data["odds"]["単勝"][b_no] = extract_float(val)
                 else:
-                    race_data["odds"]["複勝"][b_no] = val # 複勝は範囲（1.0-1.2等）のため文字列で保持
+                    race_data["odds"]["複勝"][b_no] = val
 
 # --- UI & 解析ロジック ---
 st.title("🚀 Real-Time Physics Trader v2.2")
@@ -195,25 +221,28 @@ if execute:
     st.header("🛡️ Physics Analysis Report")
     
     b1 = race_data["racelist"]["1"]
-    if b1.get('exhibition_time', 0) > max([race_data["racelist"][str(i)].get('exhibition_time', 0) for i in range(2,7)]):
-        st.error("📉 Conditional Renormalization: 1号艇に物理的欠陥を探知。確率空間を再計算してください。")
+    if b1.get('exhibition_time', 0) > 0:
+        ex_times = [race_data["racelist"][str(i)].get('exhibition_time', 0) for i in range(1,7) if race_data["racelist"][str(i)].get('exhibition_time', 0) > 0]
+        if ex_times and b1.get('exhibition_time', 0) == max(ex_times):
+            st.error("📉 Conditional Renormalization: 1号艇に物理的欠陥を探知。確率空間を再計算してください。")
 
     cols = st.columns(6)
     for i in range(1, 7):
         b = race_data["racelist"][str(i)]
         with cols[i-1]:
             st.metric(f"{i}号艇", f"{b.get('exhibition_time', 0)}s")
-            # 展示情報を追加表示
             st.write(f"展示進入: {b.get('start_course', '-')}コース")
             st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
-            st.caption(f"{b.get('name')} ({b.get('class')}) / {b.get('weight', 0.0)}kg")
+            st.caption(f"{b.get('name')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
             
             if i < 6:
-                if abs(b.get('avg_st', 0) - race_data["racelist"][str(i+1)].get('avg_st', 0)) >= 0.08:
+                next_b = race_data["racelist"][str(i+1)]
+                if abs(b.get('avg_st', 0) - next_b.get('avg_st', 0)) >= 0.08:
                     st.warning("⚠️ Void")
             
             if i > 1:
-                diff = race_data["racelist"][str(i-1)].get('exhibition_time', 0) - b.get('exhibition_time', 0)
+                prev_b = race_data["racelist"][str(i-1)]
+                diff = prev_b.get('exhibition_time', 0) - b.get('exhibition_time', 0)
                 if diff >= 0.07: st.error("🌊 Wake Rejection")
                 elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
 
