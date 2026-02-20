@@ -51,7 +51,7 @@ def get_beforeinfo(jcd, rno, hd, race_data):
     soup = BeautifulSoup(res.text, 'html.parser')
     env = race_data["environment"]
     
-    # 気象情報の抽出
+    # 水面気象
     t_el = soup.select_one('.is-direction .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
@@ -82,21 +82,23 @@ def get_beforeinfo(jcd, rno, hd, race_data):
                 "exhibition_time": extract_float(tds[4].text), "tilt": extract_float(tds[5].text)
             })
 
-    # --- スタート展示 (追加修正箇所) ---
+    # --- スタート展示ロジック (追加) ---
+    # HTMLの進入コース順に配置されている div.table1_boatImage1 を解析
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
         b_no_el = div.select_one('.table1_boatImage1Number')
         st_time_el = div.select_one('.table1_boatImage1Time')
         if b_no_el and st_time_el:
-            b_no = str(int(b_no_el.text.strip()))
-            st_val = st_time_el.text.strip() # F.02 などの形式を保持
+            # 艇番とST、進入コースを格納
+            b_no = str(int(re.search(r'\d+', b_no_el.text).group()))
+            st_val = st_time_el.text.strip()
             race_data["racelist"][b_no].update({
                 "start_course": course_idx,
                 "start_exhibition_st": st_val
             })
 
 def fetch_all_odds(jcd, rno, hd, race_data):
-    # 通常の連番系オッズ
+    # 連番系オッズ
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
         res = requests.get(f"https://www.boatrace.jp/owpc/pc/race/{otype}?rno={rno}&jcd={jcd}&hd={hd}")
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -140,31 +142,30 @@ def fetch_all_odds(jcd, rno, hd, race_data):
                 if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                     race_data["odds"]["拡連複"][f"{c+1}={tds[c*2].text.strip()}"] = tds[c*2+1].text.strip()
 
-    # --- 単勝・複勝 (追加修正箇所) ---
-    restf = requests.get(f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd}&hd={hd}")
-    soup_tf = BeautifulSoup(restf.text, 'html.parser')
+    # --- 単勝・複勝ロジック (修正) ---
+    res_tf = requests.get(f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd}&hd={hd}")
+    soup_tf = BeautifulSoup(res_tf.text, 'html.parser')
     
-    # 単勝の抽出
-    win_table = soup_tf.select_one('.table1.is-w218') # 単勝テーブル
-    if win_table:
-        for tr in win_table.select('tbody tr'):
+    # ページ内の grid_unit をループして「単勝」と「複勝」のテーブルを判別
+    for unit in soup_tf.select('.grid_unit'):
+        label = unit.select_one('.title7_mainLabel')
+        if not label: continue
+        
+        mode = None
+        if "単勝" in label.text: mode = "単勝"
+        elif "複勝" in label.text: mode = "複勝"
+        if not mode: continue
+        
+        for tr in unit.select('table tbody tr'):
             tds = tr.select('td')
-            if len(tds) >= 2:
-                b_no = tds[0].text.strip()
-                odds_val = tds[1].text.strip()
-                if "is-disabled" not in tds[1].get('class', []):
-                    race_data["odds"]["単勝"][b_no] = extract_float(odds_val)
-
-    # 複勝の抽出
-    place_table = soup_tf.select_one('.table1.is-w490') # 複勝テーブル
-    if place_table:
-        for tr in place_table.select('tbody tr'):
-            tds = tr.select('td')
-            if len(tds) >= 2:
-                b_no = tds[0].text.strip()
-                odds_val = tds[1].text.strip() # 複勝は「1.0-1.2」のような範囲表記のため文字列で保持
-                if "is-disabled" not in tds[1].get('class', []):
-                    race_data["odds"]["複勝"][b_no] = odds_val
+            if len(tds) < 3: continue
+            b_no = tds[0].text.strip()
+            val = tds[2].text.strip()
+            if "is-disabled" not in tds[2].get('class', []):
+                if mode == "単勝":
+                    race_data["odds"]["単勝"][b_no] = extract_float(val)
+                else:
+                    race_data["odds"]["複勝"][b_no] = val # 複勝は範囲（1.0-1.2等）のため文字列で保持
 
 # --- UI & 解析ロジック ---
 st.title("🚀 Real-Time Physics Trader v2.2")
@@ -202,10 +203,9 @@ if execute:
         b = race_data["racelist"][str(i)]
         with cols[i-1]:
             st.metric(f"{i}号艇", f"{b.get('exhibition_time', 0)}s")
-            # スタート展示情報の表示を追加
+            # 展示情報を追加表示
             st.write(f"展示進入: {b.get('start_course', '-')}コース")
             st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
-            
             st.caption(f"{b.get('name')} ({b.get('class')}) / {b.get('weight', 0.0)}kg")
             
             if i < 6:
