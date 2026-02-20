@@ -35,7 +35,6 @@ def get_racelist(jcd, rno, hd, race_data):
         name = tbody.select_one('.is-fs18.is-fBold').text.strip().replace('\u3000', ' ')
         rank = tbody.select_one('.is-fColor1').text.strip() if tbody.select_one('.is-fColor1') else ""
         
-        # 体重データの抽出
         weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
         weight = float(weight_match.group(1)) if weight_match else 0.0
 
@@ -52,6 +51,7 @@ def get_beforeinfo(jcd, rno, hd, race_data):
     soup = BeautifulSoup(res.text, 'html.parser')
     env = race_data["environment"]
     
+    # 気象情報の抽出
     t_el = soup.select_one('.is-direction .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
@@ -63,6 +63,7 @@ def get_beforeinfo(jcd, rno, hd, race_data):
     wh_el = soup.select_one('.is-wave .weather1_bodyUnitLabelData')
     if wh_el: env['wave_height'] = extract_float(wh_el.text)
 
+    # 風向き
     wd_img = soup.select_one('.is-windDirection .weather1_bodyUnitImage')
     if wd_img and wd_img.has_attr('class'):
         for cls in wd_img['class']:
@@ -72,6 +73,7 @@ def get_beforeinfo(jcd, rno, hd, race_data):
                 env['wind_direction'] = dir_map.get(num, "無風")
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
 
+    # 展示タイム・チルト
     for tbody in soup.select('.table1 tbody.is-fs12'):
         tds = tbody.find_all('tr')[0].find_all('td')
         if len(tds) >= 6:
@@ -80,7 +82,21 @@ def get_beforeinfo(jcd, rno, hd, race_data):
                 "exhibition_time": extract_float(tds[4].text), "tilt": extract_float(tds[5].text)
             })
 
+    # --- スタート展示 (追加修正箇所) ---
+    st_ex_divs = soup.select('.table1_boatImage1')
+    for course_idx, div in enumerate(st_ex_divs, 1):
+        b_no_el = div.select_one('.table1_boatImage1Number')
+        st_time_el = div.select_one('.table1_boatImage1Time')
+        if b_no_el and st_time_el:
+            b_no = str(int(b_no_el.text.strip()))
+            st_val = st_time_el.text.strip() # F.02 などの形式を保持
+            race_data["racelist"][b_no].update({
+                "start_course": course_idx,
+                "start_exhibition_st": st_val
+            })
+
 def fetch_all_odds(jcd, rno, hd, race_data):
+    # 通常の連番系オッズ
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
         res = requests.get(f"https://www.boatrace.jp/owpc/pc/race/{otype}?rno={rno}&jcd={jcd}&hd={hd}")
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -114,6 +130,7 @@ def fetch_all_odds(jcd, rno, hd, race_data):
                             if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                                 race_data["odds"][k][f"{c+1}{s}{tds[c*2].text.strip()}"] = extract_float(tds[c*2+1].text)
 
+    # 拡連複
     resk = requests.get(f"https://www.boatrace.jp/owpc/pc/race/oddsk?rno={rno}&jcd={jcd}&hd={hd}")
     tbk = BeautifulSoup(resk.text, 'html.parser').select_one('tbody.is-p3-0')
     if tbk:
@@ -122,6 +139,32 @@ def fetch_all_odds(jcd, rno, hd, race_data):
             for c in range(6):
                 if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                     race_data["odds"]["拡連複"][f"{c+1}={tds[c*2].text.strip()}"] = tds[c*2+1].text.strip()
+
+    # --- 単勝・複勝 (追加修正箇所) ---
+    restf = requests.get(f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd}&hd={hd}")
+    soup_tf = BeautifulSoup(restf.text, 'html.parser')
+    
+    # 単勝の抽出
+    win_table = soup_tf.select_one('.table1.is-w218') # 単勝テーブル
+    if win_table:
+        for tr in win_table.select('tbody tr'):
+            tds = tr.select('td')
+            if len(tds) >= 2:
+                b_no = tds[0].text.strip()
+                odds_val = tds[1].text.strip()
+                if "is-disabled" not in tds[1].get('class', []):
+                    race_data["odds"]["単勝"][b_no] = extract_float(odds_val)
+
+    # 複勝の抽出
+    place_table = soup_tf.select_one('.table1.is-w490') # 複勝テーブル
+    if place_table:
+        for tr in place_table.select('tbody tr'):
+            tds = tr.select('td')
+            if len(tds) >= 2:
+                b_no = tds[0].text.strip()
+                odds_val = tds[1].text.strip() # 複勝は「1.0-1.2」のような範囲表記のため文字列で保持
+                if "is-disabled" not in tds[1].get('class', []):
+                    race_data["odds"]["複勝"][b_no] = odds_val
 
 # --- UI & 解析ロジック ---
 st.title("🚀 Real-Time Physics Trader v2.2")
@@ -150,7 +193,6 @@ if execute:
     # --- 物理レポート ---
     st.header("🛡️ Physics Analysis Report")
     
-    # 1号艇の物理的欠陥判定 (Conditional Renormalization)
     b1 = race_data["racelist"]["1"]
     if b1.get('exhibition_time', 0) > max([race_data["racelist"][str(i)].get('exhibition_time', 0) for i in range(2,7)]):
         st.error("📉 Conditional Renormalization: 1号艇に物理的欠陥を探知。確率空間を再計算してください。")
@@ -160,24 +202,24 @@ if execute:
         b = race_data["racelist"][str(i)]
         with cols[i-1]:
             st.metric(f"{i}号艇", f"{b.get('exhibition_time', 0)}s")
+            # スタート展示情報の表示を追加
+            st.write(f"展示進入: {b.get('start_course', '-')}コース")
+            st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
+            
             st.caption(f"{b.get('name')} ({b.get('class')}) / {b.get('weight', 0.0)}kg")
             
-            # 真空判定 (Deterministic Void)
             if i < 6:
                 if abs(b.get('avg_st', 0) - race_data["racelist"][str(i+1)].get('avg_st', 0)) >= 0.08:
                     st.warning("⚠️ Void")
             
-            # 航跡拒絶 (Wake Rejection)
             if i > 1:
                 diff = race_data["racelist"][str(i-1)].get('exhibition_time', 0) - b.get('exhibition_time', 0)
                 if diff >= 0.07: st.error("🌊 Wake Rejection")
                 elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
 
-    # --- データ出力 ---
     st.subheader("Raw AI Data")
     st.json(race_data)
 
-    # JSONダウンロードボタン
     json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
     st.download_button(
         label="📥 AI解析用JSONをダウンロード",
