@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import json
 import re
+import time
 from bs4 import BeautifulSoup
 from datetime import datetime
 import concurrent.futures
@@ -33,13 +34,17 @@ def extract_float(text):
 
 # --- スクレイピング・エンジン (並列取得＆分離解析) ---
 
-def fetch_html(url, session):
-    try:
-        res = session.get(url, timeout=10)
-        res.encoding = 'utf-8'
-        return res.text
-    except Exception as e:
-        return ""
+def fetch_html(url, session, retries=3):
+    for i in range(retries):
+        try:
+            res = session.get(url, timeout=10)
+            res.raise_for_status()
+            res.encoding = 'utf-8'
+            return res.text
+        except Exception:
+            if i == retries - 1:
+                return ""
+            time.sleep(1) # WAFブロック回避のため1秒待機してリトライ
 
 def parse_racelist(html_text, race_data):
     if not html_text: return
@@ -83,7 +88,8 @@ def parse_beforeinfo(html_text, race_data):
     soup = BeautifulSoup(html_text, 'html.parser')
     env = race_data["environment"]
     
-    t_el = soup.select_one('.is-direction .weather1_bodyUnitLabelData')
+    # 環境情報の取得
+    t_el = soup.select_one('.is-temperature .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
     if w_el: env['weather'] = w_el.text.strip()
@@ -97,19 +103,21 @@ def parse_beforeinfo(html_text, race_data):
     wd_img = soup.select_one('.is-windDirection .weather1_bodyUnitImage')
     if wd_img and wd_img.has_attr('class'):
         for cls in wd_img['class']:
-            if cls.startswith('is-wind') and cls != 'is-windDirection':
-                num = int(cls.replace('is-wind', ''))
-                dir_map = {i: "追い風" if i in [1,2,3,4,14,15,16] else "横風" if i in [5,13] else "向かい風" for i in range(1,17)}
-                env['wind_direction'] = dir_map.get(num, "無風")
+            if cls.startswith('is-wind') and cls not in ['is-windDirection', 'is-wind']:
+                try:
+                    num = int(cls.replace('is-wind', ''))
+                    dir_map = {i: "追い風" if i in [1,2,3,4,14,15,16] else "横風" if i in [5,13] else "向かい風" for i in range(1,17)}
+                    env['wind_direction'] = dir_map.get(num, "無風")
+                except ValueError:
+                    pass
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
 
-# is-fs12 に依存せず tbody を取得
+    # 展示タイム・チルトの取得
     for tbody in soup.select('.table1 tbody'):
         trs = tbody.find_all('tr')
         if not trs: continue
         tds = trs[0].find_all('td')
         
-        # 'is-boatColor' を含むtdを検索し、枠番と配列内のインデックスを特定
         b_no = None
         boat_idx = -1
         for i, td in enumerate(tds):
@@ -120,15 +128,15 @@ def parse_beforeinfo(html_text, race_data):
                     boat_idx = i
                 break
 
-        # 枠番が特定でき、かつ後続のデータ列が存在する場合
         if b_no and boat_idx != -1 and b_no in race_data["racelist"]:
-            # 基準(boat_idx)から相対位置で取得: レーサー(+1) -> 体重/調整(+2) -> チルト(+3) -> 展示タイム(+4)
-            if len(tds) > boat_idx + 4:
+            # 体重(+3) -> チルト(+4) -> 展示タイム(+5)
+            if len(tds) > boat_idx + 5:
                 race_data["racelist"][b_no].update({
-                    "tilt": extract_float(tds[boat_idx + 3].text),
-                    "exhibition_time": extract_float(tds[boat_idx + 4].text)
+                    "tilt": extract_float(tds[boat_idx + 4].text),
+                    "exhibition_time": extract_float(tds[boat_idx + 5].text)
                 })
 
+    # スタート展示（コース・ST）の取得
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
         b_no_el = div.select_one('.table1_boatImage1Number')
@@ -138,10 +146,11 @@ def parse_beforeinfo(html_text, race_data):
             if b_no_match:
                 b_no = b_no_match.group()
                 st_val = st_time_el.text.strip()
-                race_data["racelist"][b_no].update({
-                    "start_course": course_idx,
-                    "start_exhibition_st": st_val
-                })
+                if b_no in race_data["racelist"]:
+                    race_data["racelist"][b_no].update({
+                        "start_course": course_idx,
+                        "start_exhibition_st": st_val
+                    })
 
 def parse_all_odds(html_dict, race_data):
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
@@ -211,8 +220,8 @@ def parse_all_odds(html_dict, race_data):
 # --- 絶対的除外フィルター (Step 0) の事前判定 ---
 def evaluate_ken_conditions(race_data):
     reasons = []
-    env = race_data["environment"]
-    rl = race_data["racelist"]
+    env = race_data.get("environment", {})
+    rl = race_data.get("racelist", {})
     stadium = race_data["metadata"]["stadium"]
     
     # 展示情報の公開前かどうかのチェック
@@ -333,6 +342,10 @@ if execute:
                 html_data[key] = future.result()
 
         st.write("🧠 取得したHTMLデータを解析中...")
+        
+        if not html_data.get("beforeinfo"):
+            st.error("🚨 直前情報ページのHTML取得に失敗しました（サーバーによる一時的なアクセス遮断の可能性）。数秒待ってから再度「起動」を押してください。")
+
         parse_racelist(html_data.get("racelist"), race_data)
         parse_beforeinfo(html_data.get("beforeinfo"), race_data)
         parse_all_odds(html_data, race_data)
@@ -400,4 +413,3 @@ if execute:
 
     with st.expander("Raw AI Data を確認"):
         st.json(race_data)
-
