@@ -27,6 +27,30 @@ def extract_float(text):
 
 # --- スクレイピング・エンジン ---
 
+@st.cache_data(ttl=300) # 5分間キャッシュして無駄なアクセスを減らす
+def fetch_held_stadiums(target_date):
+    """指定した日付に開催しているレース場一覧を取得する"""
+    url = f"https://www.boatrace.jp/owpc/pc/race/index?hd={target_date}"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        res.raise_for_status()
+        res.encoding = 'utf-8'
+        
+        # HTMLから開催中のレース場名（alt属性）を抽出
+        matches = re.findall(r'<img[^>]+src="/static_extra/pc/images/text_place1_\d{2}\.png"[^>]+alt="([^"]+)"', res.text)
+        
+        # 重複を排除し、JCD_MAPに存在する場のみをリスト化
+        held_stadiums = []
+        for name in matches:
+            clean_name = name.strip()
+            if clean_name in JCD_MAP and clean_name not in held_stadiums:
+                held_stadiums.append(clean_name)
+                
+        return held_stadiums
+    except Exception as e:
+        print(f"開催場取得エラー: {e}")
+        return []
+
 def fetch_html(url, session, retries=3):
     for i in range(retries):
         try:
@@ -261,9 +285,21 @@ st.title("🚀 Real-Time Physics Trader v4.9 - Ultra-Relaxed")
 
 with st.sidebar:
     st.header("Race Settings")
-    input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
-    target_rno = st.number_input("レース番号(R)", 1, 12, 12)
+    
+    # 選択した日付に基づいて、開催中の場を取得
     target_date = st.date_input("日付", datetime.now()).strftime('%Y%m%d')
+    held_stadiums = fetch_held_stadiums(target_date)
+    
+    # 開催場がない場合は全ての場を選択可能にしておく（保険用）
+    display_stadiums = held_stadiums if held_stadiums else list(JCD_MAP.keys())
+    
+    input_jcd = st.selectbox("開催場", display_stadiums)
+    
+    if not held_stadiums:
+        st.caption("※開催データを取得できなかったため全場を表示しています")
+        
+    target_rno = st.number_input("レース番号(R)", 1, 12, 12)
+    
     execute = st.button("物理解析エンジン 起動")
 
 if execute:
