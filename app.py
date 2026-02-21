@@ -52,18 +52,25 @@ def fetch_available_races(target_date):
                 
             text_content = trs[0].text
             
-            # 「発売終了」や「中止」が含まれる場は除外する
-            if "発売終了" in text_content or "中止" in text_content:
+            # 「最終Ｒ発売終了」または「中止」が含まれる場は完全に終了・除外
+            if "最終Ｒ発売終了" in text_content or "中止" in text_content:
                 continue
                 
-            # 現在の発売中レース番号を探す（例: <td>5R</td>）
+            # 現在の発売中レース番号を探す
             current_r = 1
             for td in trs[0].find_all('td'):
                 txt = td.text.strip()
-                m = re.match(r'^(\d{1,2})R$', txt)
+                # <td>5R</td> のような完全一致パターンを探す
+                m = re.search(r'^(\d{1,2})R$', txt)
                 if m:
                     current_r = int(m.group(1))
                     break
+                # <td>5R以降発売中</td> などのテキストが混ざっていた場合のフォールバック
+                elif "R" in txt and "発売中" in txt:
+                    m2 = re.search(r'(\d{1,2})R', txt)
+                    if m2:
+                        current_r = int(m2.group(1))
+                        break
             
             # 現在のレース番号から12Rまでをリスト化して保存
             available_dict[stadium_name] = list(range(current_r, 13))
@@ -254,10 +261,6 @@ def parse_all_odds(html_dict, race_data):
 
 # --- 超・緩和版：絶対的除外フィルター (Step 0) ---
 def evaluate_ken_conditions(race_data):
-    """
-    v4.9 Ultra-Relaxed版では、展示タイムが公開されているかどうかの
-    最低限のチェックのみ行い、物理的な弾きは全てAI側に委ねる。
-    """
     rl = race_data.get("racelist", {})
     
     # 直前情報（展示タイム）が公開されているかチェック
@@ -317,7 +320,7 @@ with st.sidebar:
         # 選んだ場に応じて、現在〜12Rの選択肢を動的に表示する
         target_rno = st.selectbox("レース番号(R)", available_races_dict[input_jcd])
     else:
-        # 深夜や早朝など、データが取得できない場合のフォールバック
+        # 夜間や全レース終了後など、データが取得できない場合のフォールバック
         st.caption("※現在発売中のデータが取得できないため、全場・全レースを表示しています")
         input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
         target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
