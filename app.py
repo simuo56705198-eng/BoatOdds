@@ -6,6 +6,8 @@ import time
 from bs4 import BeautifulSoup
 from datetime import datetime
 import concurrent.futures
+import csv
+import os
 
 # --- 初期設定 ---
 st.set_page_config(page_title="Real-Time Physics Trader v2.2 - Balanced Filter", layout="wide")
@@ -338,6 +340,45 @@ if execute:
     else:
         st.success("✅ **【ノイズクリア】** AIへ解析を依頼してください。")
 
+    # --- バックテスト用ロギング関数 ---
+    def log_race_data_to_csv(race_data, ken_reasons):
+        log_file = "rtpt_backtest_log.csv"
+        file_exists = os.path.isfile(log_file)
+        
+        env = race_data.get("environment", {})
+        rl = race_data.get("racelist", {})
+        meta = race_data.get("metadata", {})
+        
+        # 記録するデータをフラットに展開
+        log_row = {
+            "date": meta.get("date"),
+            "stadium": meta.get("stadium"),
+            "race_number": meta.get("race_number"),
+            "wind_speed": env.get("wind_speed", 0.0),
+            "wave_height": env.get("wave_height", 0.0),
+            "ken_filter_passed": "Yes" if not ken_reasons else "No",
+            "ken_reasons": " | ".join(ken_reasons) if ken_reasons else ""
+        }
+        
+        for i in range(1, 7):
+            b = rl.get(str(i), {})
+            log_row[f"boat{i}_class"] = b.get("class", "")
+            log_row[f"boat{i}_motor2ren"] = b.get("motor_2ren", 0.0)
+            log_row[f"boat{i}_ex_time"] = b.get("exhibition_time", 0.0)
+            log_row[f"boat{i}_avg_st"] = b.get("avg_st", 0.0)
+            log_row[f"boat{i}_ex_st"] = b.get("start_exhibition_st", "")
+        
+        # CSV書き込み
+        fieldnames = list(log_row.keys())
+        with open(log_file, mode="a", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(log_row)
+    
+    # 実行ブロック（ # --- JSONダウンロード --- の直前に配置）
+    log_race_data_to_csv(race_data, ken_reasons)
+    
     # --- JSONダウンロード ---
     json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
     st.download_button(
@@ -384,3 +425,4 @@ if execute:
 
     with st.expander("Raw AI Data を確認"):
         st.json(race_data)
+
