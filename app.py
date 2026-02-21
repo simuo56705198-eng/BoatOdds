@@ -29,50 +29,42 @@ def extract_float(text):
 
 @st.cache_data(ttl=60) # レース進行は早いため、キャッシュは1分間に設定
 def fetch_available_races(target_date):
-    """指定した日付の開催場と、現在投票可能なレース番号（現在〜12R）を取得する"""
+    """指定した日付の開催場と、現在投票可能なレース番号（現在〜12R）を確実に取得する"""
     url = f"https://www.boatrace.jp/owpc/pc/race/index?hd={target_date}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         res.raise_for_status()
         res.encoding = 'utf-8'
-        soup = BeautifulSoup(res.text, 'html.parser')
+        html_text = res.text
         
         available_dict = {}
-        for tbody in soup.select('.table1 tbody'):
-            trs = tbody.find_all('tr')
-            if not trs: continue
+        
+        # HTML全体から <tbody> 単位のブロックを抽出
+        tbodies = re.finditer(r'<tbody.*?>.*?</tbody>', html_text, re.DOTALL)
+        
+        for match in tbodies:
+            tbody_html = match.group(0)
             
-            # 場名取得
-            img_tag = trs[0].select_one('td img')
-            if not img_tag or 'alt' not in img_tag.attrs:
+            # 場名（alt属性）の抽出
+            stadium_match = re.search(r'alt="([^"]+)"', tbody_html)
+            if not stadium_match:
                 continue
-            stadium_name = img_tag['alt'].strip()
+            
+            stadium_name = stadium_match.group(1).strip()
             if stadium_name not in JCD_MAP:
                 continue
                 
-            text_content = trs[0].text
-            
-            # 「最終Ｒ発売終了」または「中止」が含まれる場は完全に終了・除外
-            if "最終Ｒ発売終了" in text_content or "中止" in text_content:
+            # 「最終Ｒ発売終了」または「中止」が含まれる場は除外
+            if "最終Ｒ発売終了" in tbody_html or "中止" in tbody_html:
                 continue
                 
-            # 現在の発売中レース番号を探す
+            # 現在の発売中レース番号を探す（<td>5R</td> のようなパターン）
             current_r = 1
-            for td in trs[0].find_all('td'):
-                txt = td.text.strip()
-                # <td>5R</td> のような完全一致パターンを探す
-                m = re.search(r'^(\d{1,2})R$', txt)
-                if m:
-                    current_r = int(m.group(1))
-                    break
-                # <td>5R以降発売中</td> などのテキストが混ざっていた場合のフォールバック
-                elif "R" in txt and "発売中" in txt:
-                    m2 = re.search(r'(\d{1,2})R', txt)
-                    if m2:
-                        current_r = int(m2.group(1))
-                        break
+            r_match = re.search(r'>(\d{1,2})R<', tbody_html)
+            if r_match:
+                current_r = int(r_match.group(1))
             
-            # 現在のレース番号から12Rまでをリスト化して保存
+            # 1R〜12Rのうち、現在のレース以降をリスト化して保存
             available_dict[stadium_name] = list(range(current_r, 13))
             
         return available_dict
@@ -316,9 +308,15 @@ with st.sidebar:
     
     if available_races_dict:
         # すでに全レース終了した場はここには含まれない
-        input_jcd = st.selectbox("開催場", list(available_races_dict.keys()))
-        # 選んだ場に応じて、現在〜12Rの選択肢を動的に表示する
-        target_rno = st.selectbox("レース番号(R)", available_races_dict[input_jcd])
+        stadiums = list(available_races_dict.keys())
+        if stadiums:
+            input_jcd = st.selectbox("開催場", stadiums)
+            # 選んだ場に応じて、現在〜12Rの選択肢を動的に表示する
+            target_rno = st.selectbox("レース番号(R)", available_races_dict[input_jcd])
+        else:
+            st.caption("※本日の全レースが終了しているか、データが取得できません。")
+            input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
+            target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
     else:
         # 夜間や全レース終了後など、データが取得できない場合のフォールバック
         st.caption("※現在発売中のデータが取得できないため、全場・全レースを表示しています")
