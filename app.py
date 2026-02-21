@@ -3,14 +3,14 @@ import requests
 import json
 import re
 import time
+import csv
+import os
 from bs4 import BeautifulSoup
 from datetime import datetime
 import concurrent.futures
-import csv
-import os
 
 # --- 初期設定 ---
-st.set_page_config(page_title="Real-Time Physics Trader v2.2 - Balanced Filter", layout="wide")
+st.set_page_config(page_title="Real-Time Physics Trader v2.3 - Relaxed Filter", layout="wide")
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
@@ -18,15 +18,6 @@ JCD_MAP = {
     "びわこ": "11", "住之江": "12", "尼崎": "13", "鳴門": "14", "丸亀": "15",
     "児島": "16", "宮島": "17", "徳山": "18", "下関": "19", "若松": "20",
     "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24"
-}
-
-# 外部CSVの代用（モーター交換月データ）
-MOTOR_MONTHS = {
-    "桐生": 12, "戸田": 7, "江戸川": 8, "平和島": 6, "多摩川": 8,
-    "浜名湖": 9, "蒲郡": 5, "常滑": 12, "津": 9, "三国": 4,
-    "びわこ": 6, "住之江": 3, "尼崎": 4, "鳴門": 4, "丸亀": 11,
-    "児島": 1, "宮島": 11, "徳山": 5, "下関": 2, "若松": 12,
-    "芦屋": 5, "福岡": 6, "唐津": 8, "大村": 6
 }
 
 def extract_float(text):
@@ -226,61 +217,74 @@ def evaluate_ken_conditions(race_data):
     if len(valid_ex_times) == 0:
         return ["NOT_READY"]
 
-    # 1. データ汚染判定 (緩和：交換月そのもののみ排除)
-    month = int(race_data["metadata"]["date"][4:6])
-    motor_month = MOTOR_MONTHS.get(stadium, 1)
-    diff_month = month - motor_month
-    if diff_month < 0: diff_month += 12
-    if diff_month == 0:  # 1ヶ月以内(<=1)から、交換当月(==0)に緩和
-        reasons.append(f"データ汚染限界: モーター交換({motor_month}月)直後のため平滑化未了")
-
-    # 2. 異常気象・極限流体カオス (緩和)
+    # 1. 異常気象・極限流体カオス
     wind = env.get("wind_speed", 0.0)
     wave = env.get("wave_height", 0.0)
     if wind >= 8.0:
         reasons.append(f"異常気象限界: 風速が8m/s以上 ({wind}m/s)")
-    if stadium == "江戸川" and (wave >= 6.0 or wind >= 7.0): # 5.0 -> 6.0/7.0に緩和
+    if stadium == "江戸川" and (wave >= 6.0 or wind >= 7.0):
         reasons.append(f"極限流体カオス (江戸川): 物理的限界値超過")
-    if stadium == "びわこ" and wind >= 5.0: # 4.0 -> 5.0に緩和
+    if stadium == "びわこ" and wind >= 5.0:
         reasons.append(f"極限流体カオス (びわこ): 風速5m/s以上")
 
-    # 3. 幾何学的カオス (緩和：B級5名以上)
+    # 2. 幾何学的カオス (B級5名以上)
     b_class_count = sum(1 for d in rl.values() if d.get("class") in ["B1", "B2", ""])
-    if stadium in ["戸田", "尼崎"] and b_class_count >= 5: # 4 -> 5名に緩和
+    if stadium in ["戸田", "尼崎"] and b_class_count >= 5:
         reasons.append(f"幾何学的カオス誘発 ({stadium}): B級選手が5名以上参戦")
 
-    # 4. 住之江特効判定 (緩和：0.08s)
+    # 3. 住之江特効判定
     if stadium == "住之江":
         ex_times = [d["exhibition_time"] for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
         avg_et = sum(ex_times) / len(ex_times)
-        limit_et = 0.05 if env.get("weather") in ["雨", "雪"] else 0.08 # 0.03/0.05 -> 0.05/0.08に緩和
+        limit_et = 0.05 if env.get("weather") in ["雨", "雪"] else 0.08
         for b_no in ["1", "2", "3"]:
             d = rl.get(b_no, {})
             if d.get("class") not in ["A1", "A2"] and d.get("exhibition_time", 0.0) > 0:
                 if (d["exhibition_time"] - avg_et) >= limit_et:
                     reasons.append(f"極限流体カオス (住之江): {b_no}号艇の遅延が許容限界を突破")
 
-    # 5. 前付け (緩和：1号艇が1コースを守っていればOKとする)
+    # 4. 前付け判定
     if rl.get("1", {}).get("start_course") != 1:
         reasons.append("初期値崩壊: 1号艇がインコースを奪取されました")
 
-    # 6. 展示スナップショット乖離 (緩和：0.15s / 0.20s)
-    for b_no, d in rl.items():
-        st_str = d.get("start_exhibition_st", "").replace("F", "").replace("L", "").replace(".", "0.")
-        try:
-            st_val = float(st_str) if st_str else 0.25
-        except ValueError:
-            st_val = 0.25
-        
-        diff = abs(st_val - d.get("avg_st", 0.15))
-        limit_st = 0.20 if d.get("class") in ["A1", "A2"] else 0.15 # 0.15/0.10 -> 0.20/0.15に緩和
-        if diff >= limit_st:
-            reasons.append(f"展示乖離: {b_no}号艇のSTノイズが限界突破({diff:.2f})")
-
     return list(set(reasons))
 
+# --- バックテスト用ロギング関数 ---
+def log_race_data_to_csv(race_data, ken_reasons):
+    log_file = "rtpt_backtest_log.csv"
+    file_exists = os.path.isfile(log_file)
+    
+    env = race_data.get("environment", {})
+    rl = race_data.get("racelist", {})
+    meta = race_data.get("metadata", {})
+    
+    log_row = {
+        "date": meta.get("date"),
+        "stadium": meta.get("stadium"),
+        "race_number": meta.get("race_number"),
+        "wind_speed": env.get("wind_speed", 0.0),
+        "wave_height": env.get("wave_height", 0.0),
+        "ken_filter_passed": "Yes" if not ken_reasons else "No",
+        "ken_reasons": " | ".join(ken_reasons) if ken_reasons else ""
+    }
+    
+    for i in range(1, 7):
+        b = rl.get(str(i), {})
+        log_row[f"boat{i}_class"] = b.get("class", "")
+        log_row[f"boat{i}_motor2ren"] = b.get("motor_2ren", 0.0)
+        log_row[f"boat{i}_ex_time"] = b.get("exhibition_time", 0.0)
+        log_row[f"boat{i}_avg_st"] = b.get("avg_st", 0.0)
+        log_row[f"boat{i}_ex_st"] = b.get("start_exhibition_st", "")
+    
+    fieldnames = list(log_row.keys())
+    with open(log_file, mode="a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(log_row)
+
 # --- UI & 解析ロジック ---
-st.title("🚀 Real-Time Physics Trader v2.2 - Balanced Filter")
+st.title("🚀 Real-Time Physics Trader v2.3 - Relaxed Filter")
 
 with st.sidebar:
     st.header("Race Settings")
@@ -340,45 +344,10 @@ if execute:
     else:
         st.success("✅ **【ノイズクリア】** AIへ解析を依頼してください。")
 
-    # --- バックテスト用ロギング関数 ---
-    def log_race_data_to_csv(race_data, ken_reasons):
-        log_file = "rtpt_backtest_log.csv"
-        file_exists = os.path.isfile(log_file)
-        
-        env = race_data.get("environment", {})
-        rl = race_data.get("racelist", {})
-        meta = race_data.get("metadata", {})
-        
-        # 記録するデータをフラットに展開
-        log_row = {
-            "date": meta.get("date"),
-            "stadium": meta.get("stadium"),
-            "race_number": meta.get("race_number"),
-            "wind_speed": env.get("wind_speed", 0.0),
-            "wave_height": env.get("wave_height", 0.0),
-            "ken_filter_passed": "Yes" if not ken_reasons else "No",
-            "ken_reasons": " | ".join(ken_reasons) if ken_reasons else ""
-        }
-        
-        for i in range(1, 7):
-            b = rl.get(str(i), {})
-            log_row[f"boat{i}_class"] = b.get("class", "")
-            log_row[f"boat{i}_motor2ren"] = b.get("motor_2ren", 0.0)
-            log_row[f"boat{i}_ex_time"] = b.get("exhibition_time", 0.0)
-            log_row[f"boat{i}_avg_st"] = b.get("avg_st", 0.0)
-            log_row[f"boat{i}_ex_st"] = b.get("start_exhibition_st", "")
-        
-        # CSV書き込み
-        fieldnames = list(log_row.keys())
-        with open(log_file, mode="a", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(log_row)
-    
-    # 実行ブロック（ # --- JSONダウンロード --- の直前に配置）
-    log_race_data_to_csv(race_data, ken_reasons)
-    
+    # バックテスト用データの書き出し
+    if ken_reasons != ["NOT_READY"]:
+        log_race_data_to_csv(race_data, ken_reasons)
+
     # --- JSONダウンロード ---
     json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
     st.download_button(
@@ -388,7 +357,7 @@ if execute:
         mime="application/json"
     )
 
-    # --- 物理レポート表示 (ここもフル復活) ---
+    # --- 物理レポート表示 ---
     st.header("🛡️ Physics Analysis Report")
     
     b1 = race_data["racelist"]["1"]
@@ -425,4 +394,3 @@ if execute:
 
     with st.expander("Raw AI Data を確認"):
         st.json(race_data)
-
