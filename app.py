@@ -103,15 +103,30 @@ def parse_beforeinfo(html_text, race_data):
                 env['wind_direction'] = dir_map.get(num, "無風")
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
 
-    for tbody in soup.select('.table1 tbody.is-fs12'):
-        tds = tbody.find_all('tr')[0].find_all('td')
-        # 【修正箇所】列を正しく取得。td[4]が展示タイム、td[5]がチルト。
-        if len(tds) >= 6:
-            b_no = str(int(tds[0].text.strip()))
-            if b_no in race_data["racelist"]:
+# is-fs12 に依存せず tbody を取得
+    for tbody in soup.select('.table1 tbody'):
+        trs = tbody.find_all('tr')
+        if not trs: continue
+        tds = trs[0].find_all('td')
+        
+        # 'is-boatColor' を含むtdを検索し、枠番と配列内のインデックスを特定
+        b_no = None
+        boat_idx = -1
+        for i, td in enumerate(tds):
+            if td.get('class') and any(c.startswith('is-boatColor') for c in td.get('class')):
+                match = re.search(r'\d+', td.text)
+                if match:
+                    b_no = match.group()
+                    boat_idx = i
+                break
+
+        # 枠番が特定でき、かつ後続のデータ列が存在する場合
+        if b_no and boat_idx != -1 and b_no in race_data["racelist"]:
+            # 基準(boat_idx)から相対位置で取得: レーサー(+1) -> 体重/調整(+2) -> チルト(+3) -> 展示タイム(+4)
+            if len(tds) > boat_idx + 4:
                 race_data["racelist"][b_no].update({
-                    "exhibition_time": extract_float(tds[4].text), 
-                    "tilt": extract_float(tds[5].text)
+                    "tilt": extract_float(tds[boat_idx + 3].text),
+                    "exhibition_time": extract_float(tds[boat_idx + 4].text)
                 })
 
     st_ex_divs = soup.select('.table1_boatImage1')
@@ -385,3 +400,4 @@ if execute:
 
     with st.expander("Raw AI Data を確認"):
         st.json(race_data)
+
