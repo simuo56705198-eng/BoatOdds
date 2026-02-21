@@ -47,7 +47,7 @@ def parse_racelist(html_text, race_data):
     tbodies = soup.select('.table1.is-tableFixed__3rdadd tbody.is-fs12')
     for tbody in tbodies:
         tds = tbody.find_all('tr')[0].find_all('td')
-        if len(tds) < 3: continue
+        if len(tds) < 8: continue
         
         b_no_raw = tds[0].text.strip()
         b_no_match = re.search(r'[1-6１-６]', b_no_raw)
@@ -66,15 +66,16 @@ def parse_racelist(html_text, race_data):
         weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
         weight = float(weight_match.group(1)) if weight_match else 0.0
 
-        st_txt = [x.strip() for x in tds[3].text.split('\n') if x.strip()]
-        mot = [x.strip() for x in tds[6].text.split('\n') if x.strip()]
+        # 【修正】セル内の<br>を改行に変換して適切に分割
+        st_txt = [x.strip() for x in tds[3].get_text(separator='\n').split('\n') if x.strip()]
+        mot = [x.strip() for x in tds[6].get_text(separator='\n').split('\n') if x.strip()]
         
         race_data["racelist"][b_no].update({
             "name": name, 
             "class": rank, 
             "weight": weight, 
             "motor_no": mot[0] if mot else '-',
-            "motor_2ren": float(mot[1]) if len(mot)>1 and mot[1].replace('.','').isdigit() else 30.0, 
+            "motor_2ren": extract_float(mot[1]) if len(mot)>1 else 30.0, 
             "avg_st": extract_float(st_txt[-1]) if st_txt else 0.15
         })
 
@@ -105,12 +106,14 @@ def parse_beforeinfo(html_text, race_data):
 
     for tbody in soup.select('.table1 tbody.is-fs12'):
         tds = tbody.find_all('tr')[0].find_all('td')
-        if len(tds) >= 6:
+        if len(tds) >= 7:
             b_no = str(int(tds[0].text.strip()))
-            race_data["racelist"][b_no].update({
-                "exhibition_time": extract_float(tds[4].text), 
-                "tilt": extract_float(tds[5].text)
-            })
+            if b_no in race_data["racelist"]:
+                # 【修正】td[5]が展示タイム、td[6]がチルト（F/Lはtd[4]）
+                race_data["racelist"][b_no].update({
+                    "exhibition_time": extract_float(tds[5].text), 
+                    "tilt": extract_float(tds[6].text)
+                })
 
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
@@ -127,7 +130,6 @@ def parse_beforeinfo(html_text, race_data):
                 })
 
 def parse_all_odds(html_dict, race_data):
-    # (既存のオッズ取得処理をそのまま保持)
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
         html = html_dict.get(otype)
         if not html: continue
@@ -192,18 +194,21 @@ def parse_all_odds(html_dict, race_data):
                     else:
                         race_data["odds"]["複勝"][b_no] = val
 
-# --- ★新規追加：絶対的除外フィルター (Step 0) の事前判定 ---
+# --- 絶対的除外フィルター (Step 0) の事前判定 ---
 def evaluate_ken_conditions(race_data):
     reasons = []
     env = race_data["environment"]
     rl = race_data["racelist"]
     stadium = race_data["metadata"]["stadium"]
     
-    # 日付から月を取得
+    # 【追加】展示情報の公開前かどうかのチェック
+    valid_ex_times = [d.get("exhibition_time", 0.0) for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
+    if len(valid_ex_times) == 0:
+        return ["NOT_READY"]
+
+    # 1. データ汚染判定 (1ヶ月以内)
     month = int(race_data["metadata"]["date"][4:6])
     motor_month = MOTOR_MONTHS.get(stadium, 1)
-    
-    # 1. データ汚染判定 (1ヶ月以内)
     diff_month = month - motor_month
     if diff_month < 0: diff_month += 12
     if diff_month <= 1:
@@ -252,13 +257,11 @@ def evaluate_ken_conditions(race_data):
         st_str = d.get("start_exhibition_st", "")
         avg_st = d.get("avg_st", 0.15)
         
-        # ST文字列の数値変換 (F.06 -> -0.06, .12 -> 0.12)
         st_val = 0.25
         is_f = False
         if "F" in st_str:
             is_f = True
             st_str = st_str.replace("F", "")
-        
         st_str = st_str.replace("L", "").replace(".", "0.")
         try:
             st_val = float(st_str) if st_str else 0.25
@@ -267,11 +270,11 @@ def evaluate_ken_conditions(race_data):
             
         st_val = -st_val if is_f else st_val
         
-        # 乖離判定
         diff = abs(st_val - avg_st)
         limit_st = 0.15 if d.get("class") in ["A1", "A2"] else 0.10
         if diff >= limit_st:
-            reasons.append(f"展示スナップショット乖離: {b_no}号艇の展示ST({st_str if not is_f else 'F'+st_str})と平均ST({avg_st})の差が許容限界({limit_st}秒)を突破")
+            # 正常に取得できている場合のみ判定するガード
+            reasons.append(f"展示スナップショット乖離: {b_no}号艇の展示ST({d.get('start_exhibition_st')})と平均ST({avg_st})の差が許容限界を突破")
 
     return list(set(reasons))
 
@@ -326,11 +329,13 @@ if execute:
     # --- ★事前「見（ケン）」フィルターの実行とUI表示 ---
     ken_reasons = evaluate_ken_conditions(race_data)
     
-    if ken_reasons:
+    if ken_reasons == ["NOT_READY"]:
+        st.warning("⏳ **【情報未公開】** 直前情報（展示タイム・展示STなど）がまだ公開されていません。レース締切の約20分前以降に再度実行してください。")
+    elif ken_reasons:
         st.error("🚨 **【AI解析不要 / 見（ケン）推奨レース】** 以下の致命的ノイズが検知されました。")
         for r in ken_reasons:
             st.warning(f"・ {r}")
-        st.info("💡 ※AIにプロンプトを投げるまでもなくカオス確定です。トークン節約のため別レースを検討してください。")
+        st.info("💡 ※AIにプロンプトを投げるまでもなく環境ノイズ超過が確定しています。プロンプト節約のため別レースを検討してください。")
     else:
         st.success("✅ **【ノイズクリア】** Step 0のハードリミットを通過しました。AIへ解析を依頼してください。")
 
@@ -350,32 +355,35 @@ if execute:
     if b1.get('exhibition_time', 0) > 0:
         ex_times = [race_data["racelist"][str(i)].get('exhibition_time', 0) for i in range(1,7) if race_data["racelist"][str(i)].get('exhibition_time', 0) > 0]
         if ex_times and b1.get('exhibition_time', 0) == max(ex_times):
-            st.error("📉 Conditional Renormalization: 1号艇に物理的欠陥を探知。確率空間を再計算してください。")
+            st.error("📉 Conditional Renormalization: 1号艇に物理的欠陥を探知。")
 
     cols = st.columns(6)
     for i in range(1, 7):
         b = race_data["racelist"][str(i)]
         with cols[i-1]:
             ex_time = b.get('exhibition_time', 0)
-            st.metric(f"{i}号艇", f"{ex_time}s")
+            st.metric(f"{i}号艇", f"{ex_time}s" if ex_time > 0 else "-")
             
             if ex_time == 0 or ex_time == 0.0:
-                st.warning("⚠️ 計測不能")
+                st.caption("⚠️ 展示未取得")
+            else:
+                st.write(f"展示進入: {b.get('start_course', '-')}コース")
+                st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
             
-            st.write(f"展示進入: {b.get('start_course', '-')}コース")
-            st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
-            st.caption(f"{b.get('name')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
+            st.caption(f"{b.get('name', '取得エラー')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
             
-            if i < 6:
-                next_b = race_data["racelist"][str(i+1)]
-                if abs(b.get('avg_st', 0) - next_b.get('avg_st', 0)) >= 0.08:
-                    st.warning("⚠️ Void")
-            
-            if i > 1:
-                prev_b = race_data["racelist"][str(i-1)]
-                diff = prev_b.get('exhibition_time', 0) - b.get('exhibition_time', 0)
-                if diff >= 0.07: st.error("🌊 Wake Rejection")
-                elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
+            # ボイド・ウェイク判定は展示取得後のみ実行
+            if ex_time > 0:
+                if i < 6:
+                    next_b = race_data["racelist"][str(i+1)]
+                    if abs(b.get('avg_st', 0) - next_b.get('avg_st', 0)) >= 0.08:
+                        st.warning("⚠️ Void")
+                
+                if i > 1:
+                    prev_b = race_data["racelist"][str(i-1)]
+                    diff = prev_b.get('exhibition_time', 0) - b.get('exhibition_time', 0)
+                    if diff >= 0.07: st.error("🌊 Wake Rejection")
+                    elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
 
     with st.expander("Raw AI Data を確認"):
         st.json(race_data)
