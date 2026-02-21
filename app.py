@@ -10,7 +10,7 @@ from datetime import datetime
 import concurrent.futures
 
 # --- 初期設定 ---
-st.set_page_config(page_title="Real-Time Physics Trader v2.3 - Relaxed Filter", layout="wide")
+st.set_page_config(page_title="Real-Time Physics Trader v4.9 - Ultra-Relaxed", layout="wide")
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
@@ -206,48 +206,21 @@ def parse_all_odds(html_dict, race_data):
                     else:
                         race_data["odds"]["複勝"][b_no] = val
 
-# --- 緩和版：絶対的除外フィルター (Step 0) ---
+# --- 超・緩和版：絶対的除外フィルター (Step 0) ---
 def evaluate_ken_conditions(race_data):
-    reasons = []
-    env = race_data.get("environment", {})
+    """
+    v4.9 Ultra-Relaxed版では、展示タイムが公開されているかどうかの
+    最低限のチェックのみ行い、物理的な弾きは全てAI側に委ねる。
+    """
     rl = race_data.get("racelist", {})
-    stadium = race_data["metadata"]["stadium"]
     
+    # 直前情報（展示タイム）が公開されているかチェック
     valid_ex_times = [d.get("exhibition_time", 0.0) for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
     if len(valid_ex_times) == 0:
         return ["NOT_READY"]
 
-    # 1. 異常気象・極限流体カオス
-    wind = env.get("wind_speed", 0.0)
-    wave = env.get("wave_height", 0.0)
-    if wind >= 8.0:
-        reasons.append(f"異常気象限界: 風速が8m/s以上 ({wind}m/s)")
-    if stadium == "江戸川" and (wave >= 6.0 or wind >= 7.0):
-        reasons.append(f"極限流体カオス (江戸川): 物理的限界値超過")
-    if stadium == "びわこ" and wind >= 5.0:
-        reasons.append(f"極限流体カオス (びわこ): 風速5m/s以上")
-
-    # 2. 幾何学的カオス (B級5名以上)
-    b_class_count = sum(1 for d in rl.values() if d.get("class") in ["B1", "B2", ""])
-    if stadium in ["戸田", "尼崎"] and b_class_count >= 5:
-        reasons.append(f"幾何学的カオス誘発 ({stadium}): B級選手が5名以上参戦")
-
-    # 3. 住之江特効判定
-    if stadium == "住之江":
-        ex_times = [d["exhibition_time"] for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
-        avg_et = sum(ex_times) / len(ex_times)
-        limit_et = 0.05 if env.get("weather") in ["雨", "雪"] else 0.08
-        for b_no in ["1", "2", "3"]:
-            d = rl.get(b_no, {})
-            if d.get("class") not in ["A1", "A2"] and d.get("exhibition_time", 0.0) > 0:
-                if (d["exhibition_time"] - avg_et) >= limit_et:
-                    reasons.append(f"極限流体カオス (住之江): {b_no}号艇の遅延が許容限界を突破")
-
-    # 4. 前付け判定
-    if rl.get("1", {}).get("start_course") != 1:
-        reasons.append("初期値崩壊: 1号艇がインコースを奪取されました")
-
-    return list(set(reasons))
+    # 以前存在した強風、波高、B級戦、前付けなどのフィルターは全て撤廃
+    return []
 
 # --- バックテスト用ロギング関数 ---
 def log_race_data_to_csv(race_data, ken_reasons):
@@ -284,7 +257,7 @@ def log_race_data_to_csv(race_data, ken_reasons):
         writer.writerow(log_row)
 
 # --- UI & 解析ロジック ---
-st.title("🚀 Real-Time Physics Trader v2.3 - Relaxed Filter")
+st.title("🚀 Real-Time Physics Trader v4.9 - Ultra-Relaxed")
 
 with st.sidebar:
     st.header("Race Settings")
@@ -332,17 +305,13 @@ if execute:
 
         status.update(label="解析準備完了", state="complete")
 
-    # --- 事前「見（ケン）」フィルターの実行 ---
+    # --- v4.9 超緩和フィルターの実行 ---
     ken_reasons = evaluate_ken_conditions(race_data)
     
     if ken_reasons == ["NOT_READY"]:
-        st.warning("⏳ **【情報未公開】** 直前情報がまだ公開されていません。")
-    elif ken_reasons:
-        st.error("🚨 **【見（ケン）推奨レース】** 以下の致命的ノイズが検知されました。")
-        for r in ken_reasons:
-            st.warning(f"・ {r}")
+        st.warning("⏳ **【情報未公開】** 直前情報がまだ公開されていません。展示航走終了後に再度実行してください。")
     else:
-        st.success("✅ **【ノイズクリア】** AIへ解析を依頼してください。")
+        st.success("✅ **【データ取得完了】** 直前情報取得済み。ノイズも丸ごとAIへ解析を依頼してください。")
 
     # バックテスト用データの書き出し
     if ken_reasons != ["NOT_READY"]:
@@ -364,7 +333,7 @@ if execute:
     if b1.get('exhibition_time', 0) > 0:
         ex_times = [race_data["racelist"][str(i)].get('exhibition_time', 0) for i in range(1,7) if race_data["racelist"][str(i)].get('exhibition_time', 0) > 0]
         if ex_times and b1.get('exhibition_time', 0) == max(ex_times):
-            st.error("📉 Conditional Renormalization: 1号艇に物理的欠陥を探知。")
+            st.error("📉 Conditional Renormalization: 1号艇の展示タイムに懸念あり（全艇中最遅）")
 
     cols = st.columns(6)
     for i in range(1, 7):
