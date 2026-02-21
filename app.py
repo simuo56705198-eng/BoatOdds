@@ -29,7 +29,8 @@ MOTOR_MONTHS = {
 
 def extract_float(text):
     if not text: return 0.0
-    m = re.search(r'[\d\.]+', str(text))
+    # チルトのマイナス記号（-0.5等）を正確に拾うための正規表現
+    m = re.search(r'-?[\d\.]+', str(text))
     return float(m.group()) if m else 0.0
 
 # --- スクレイピング・エンジン (並列取得＆分離解析) ---
@@ -88,7 +89,7 @@ def parse_beforeinfo(html_text, race_data):
     soup = BeautifulSoup(html_text, 'html.parser')
     env = race_data["environment"]
     
-    # 環境情報の取得
+    # 1. 環境情報の取得
     t_el = soup.select_one('.is-temperature .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
@@ -112,7 +113,7 @@ def parse_beforeinfo(html_text, race_data):
                     pass
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
 
-    # 展示タイム・チルトの取得
+    # 2. 展示タイム・チルトの取得
     for tbody in soup.select('.table1 tbody'):
         trs = tbody.find_all('tr')
         if not trs: continue
@@ -121,6 +122,7 @@ def parse_beforeinfo(html_text, race_data):
         b_no = None
         boat_idx = -1
         for i, td in enumerate(tds):
+            # 枠番の色クラス(is-boatColor)を起点にする
             if td.get('class') and any(c.startswith('is-boatColor') for c in td.get('class')):
                 match = re.search(r'\d+', td.text)
                 if match:
@@ -129,14 +131,15 @@ def parse_beforeinfo(html_text, race_data):
                 break
 
         if b_no and boat_idx != -1 and b_no in race_data["racelist"]:
-            # 体重(+3) -> チルト(+4) -> 展示タイム(+5)
-            if len(tds) > boat_idx + 5:
+            # 【重要】直前情報テーブルの構造:
+            # 枠番[idx] -> 選手名[+1] -> 体重調整[+2] -> チルト[+3] -> 展示タイム[+4]
+            if len(tds) > boat_idx + 4:
                 race_data["racelist"][b_no].update({
-                    "tilt": extract_float(tds[boat_idx + 4].text),
-                    "exhibition_time": extract_float(tds[boat_idx + 5].text)
+                    "tilt": extract_float(tds[boat_idx + 3].text),
+                    "exhibition_time": extract_float(tds[boat_idx + 4].text)
                 })
 
-    # スタート展示（コース・ST）の取得
+    # 3. スタート展示（コース・ST）の取得
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
         b_no_el = div.select_one('.table1_boatImage1Number')
@@ -344,7 +347,7 @@ if execute:
         st.write("🧠 取得したHTMLデータを解析中...")
         
         if not html_data.get("beforeinfo"):
-            st.error("🚨 直前情報ページのHTML取得に失敗しました（サーバーによる一時的なアクセス遮断の可能性）。数秒待ってから再度「起動」を押してください。")
+            st.error("🚨 直前情報ページのHTML取得に失敗しました。数秒待ってから再度実行してください。")
 
         parse_racelist(html_data.get("racelist"), race_data)
         parse_beforeinfo(html_data.get("beforeinfo"), race_data)
@@ -352,7 +355,7 @@ if execute:
 
         status.update(label="解析準備完了", state="complete")
 
-    # --- ★事前「見（ケン）」フィルターの実行とUI表示 ---
+    # --- 事前「見（ケン）」フィルターの実行とUI表示 ---
     ken_reasons = evaluate_ken_conditions(race_data)
     
     if ken_reasons == ["NOT_READY"]:
@@ -361,7 +364,7 @@ if execute:
         st.error("🚨 **【AI解析不要 / 見（ケン）推奨レース】** 以下の致命的ノイズが検知されました。")
         for r in ken_reasons:
             st.warning(f"・ {r}")
-        st.info("💡 ※AIにプロンプトを投げるまでもなく環境ノイズ超過が確定しています。プロンプト節約のため別レースを検討してください。")
+        st.info("💡 環境ノイズ超過のため、プロンプト節約の観点から別レースを検討してください。")
     else:
         st.success("✅ **【ノイズクリア】** Step 0のハードリミットを通過しました。AIへ解析を依頼してください。")
 
@@ -398,7 +401,6 @@ if execute:
             
             st.caption(f"{b.get('name', '取得エラー')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
             
-            # ボイド・ウェイク判定は展示取得後のみ実行
             if ex_time > 0:
                 if i < 6:
                     next_b = race_data["racelist"][str(i+1)]
