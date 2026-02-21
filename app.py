@@ -89,7 +89,9 @@ def parse_racelist(html_text, race_data):
     soup = BeautifulSoup(html_text, 'html.parser')
     tbodies = soup.select('.table1.is-tableFixed__3rdadd tbody.is-fs12')
     for tbody in tbodies:
-        tds = tbody.find_all('tr')[0].find_all('td')
+        trs = tbody.find_all('tr')
+        if not trs: continue
+        tds = trs[0].find_all('td')
         if len(tds) < 8: continue
         
         b_no_raw = tds[0].text.strip()
@@ -110,12 +112,19 @@ def parse_racelist(html_text, race_data):
         weight = float(weight_match.group(1)) if weight_match else 0.0
 
         st_txt = [x.strip() for x in tds[3].get_text(separator='\n').split('\n') if x.strip()]
+        
+        # --- 勝率データの抽出 (全国:tds[4], 当地:tds[5]) ---
+        nat_win_txt = [x.strip() for x in tds[4].get_text(separator='\n').split('\n') if x.strip()]
+        loc_win_txt = [x.strip() for x in tds[5].get_text(separator='\n').split('\n') if x.strip()]
+        
         mot = [x.strip() for x in tds[6].get_text(separator='\n').split('\n') if x.strip()]
         
         race_data["racelist"][b_no].update({
             "name": name, 
             "class": rank, 
             "weight": weight, 
+            "win_rate_national": extract_float(nat_win_txt[0]) if nat_win_txt else 0.0,
+            "win_rate_local": extract_float(loc_win_txt[0]) if loc_win_txt else 0.0,
             "motor_no": mot[0] if mot else '-',
             "motor_2ren": extract_float(mot[1]) if len(mot)>1 else 30.0, 
             "avg_st": extract_float(st_txt[-1]) if st_txt else 0.15
@@ -284,6 +293,8 @@ def log_race_data_to_csv(race_data, ken_reasons):
     for i in range(1, 7):
         b = rl.get(str(i), {})
         log_row[f"boat{i}_class"] = b.get("class", "")
+        log_row[f"boat{i}_win_national"] = b.get("win_rate_national", 0.0) # 追加
+        log_row[f"boat{i}_win_local"] = b.get("win_rate_local", 0.0)       # 追加
         log_row[f"boat{i}_motor2ren"] = b.get("motor_2ren", 0.0)
         log_row[f"boat{i}_ex_time"] = b.get("exhibition_time", 0.0)
         log_row[f"boat{i}_avg_st"] = b.get("avg_st", 0.0)
@@ -402,6 +413,10 @@ if execute:
             st.metric(f"{i}号艇", f"{ex_time}s" if ex_time > 0 else "-")
             
             if ex_time > 0:
+                # --- 勝率データの表示を追加 ---
+                st.write(f"🚩 全国: {b.get('win_rate_national', 0.0):.2f}")
+                st.write(f"📍 当地: {b.get('win_rate_local', 0.0):.2f}")
+                
                 st.write(f"展示進入: {b.get('start_course', '-')}コース")
                 st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
                 st.caption(f"{b.get('name', '取得エラー')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
