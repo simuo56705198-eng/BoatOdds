@@ -66,7 +66,6 @@ def parse_racelist(html_text, race_data):
         weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
         weight = float(weight_match.group(1)) if weight_match else 0.0
 
-        # 【修正】セル内の<br>を改行に変換して適切に分割
         st_txt = [x.strip() for x in tds[3].get_text(separator='\n').split('\n') if x.strip()]
         mot = [x.strip() for x in tds[6].get_text(separator='\n').split('\n') if x.strip()]
         
@@ -106,13 +105,13 @@ def parse_beforeinfo(html_text, race_data):
 
     for tbody in soup.select('.table1 tbody.is-fs12'):
         tds = tbody.find_all('tr')[0].find_all('td')
-        if len(tds) >= 7:
+        # 【修正箇所】列を正しく取得。td[4]が展示タイム、td[5]がチルト。
+        if len(tds) >= 6:
             b_no = str(int(tds[0].text.strip()))
             if b_no in race_data["racelist"]:
-                # 【修正】td[5]が展示タイム、td[6]がチルト（F/Lはtd[4]）
                 race_data["racelist"][b_no].update({
-                    "exhibition_time": extract_float(tds[5].text), 
-                    "tilt": extract_float(tds[6].text)
+                    "exhibition_time": extract_float(tds[4].text), 
+                    "tilt": extract_float(tds[5].text)
                 })
 
     st_ex_divs = soup.select('.table1_boatImage1')
@@ -201,7 +200,7 @@ def evaluate_ken_conditions(race_data):
     rl = race_data["racelist"]
     stadium = race_data["metadata"]["stadium"]
     
-    # 【追加】展示情報の公開前かどうかのチェック
+    # 展示情報の公開前かどうかのチェック
     valid_ex_times = [d.get("exhibition_time", 0.0) for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
     if len(valid_ex_times) == 0:
         return ["NOT_READY"]
@@ -273,7 +272,6 @@ def evaluate_ken_conditions(race_data):
         diff = abs(st_val - avg_st)
         limit_st = 0.15 if d.get("class") in ["A1", "A2"] else 0.10
         if diff >= limit_st:
-            # 正常に取得できている場合のみ判定するガード
             reasons.append(f"展示スナップショット乖離: {b_no}号艇の展示ST({d.get('start_exhibition_st')})と平均ST({avg_st})の差が許容限界を突破")
 
     return list(set(reasons))
