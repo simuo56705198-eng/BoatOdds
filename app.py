@@ -8,7 +8,7 @@ from datetime import datetime
 import concurrent.futures
 
 # --- 初期設定 ---
-st.set_page_config(page_title="Real-Time Physics Trader v2.2 - Pre-Ken Filter", layout="wide")
+st.set_page_config(page_title="Real-Time Physics Trader v2.2 - Balanced Filter", layout="wide")
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
@@ -29,11 +29,10 @@ MOTOR_MONTHS = {
 
 def extract_float(text):
     if not text: return 0.0
-    # チルトのマイナス記号（-0.5等）を正確に拾うための正規表現
     m = re.search(r'-?[\d\.]+', str(text))
     return float(m.group()) if m else 0.0
 
-# --- スクレイピング・エンジン (並列取得＆分離解析) ---
+# --- スクレイピング・エンジン ---
 
 def fetch_html(url, session, retries=3):
     for i in range(retries):
@@ -45,7 +44,7 @@ def fetch_html(url, session, retries=3):
         except Exception:
             if i == retries - 1:
                 return ""
-            time.sleep(1) # WAFブロック回避のため1秒待機してリトライ
+            time.sleep(1)
 
 def parse_racelist(html_text, race_data):
     if not html_text: return
@@ -89,7 +88,6 @@ def parse_beforeinfo(html_text, race_data):
     soup = BeautifulSoup(html_text, 'html.parser')
     env = race_data["environment"]
     
-    # 1. 環境情報の取得
     t_el = soup.select_one('.is-temperature .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
@@ -113,7 +111,6 @@ def parse_beforeinfo(html_text, race_data):
                     pass
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
 
-    # 2. 展示タイム・チルトの取得
     for tbody in soup.select('.table1 tbody'):
         trs = tbody.find_all('tr')
         if not trs: continue
@@ -122,7 +119,6 @@ def parse_beforeinfo(html_text, race_data):
         b_no = None
         boat_idx = -1
         for i, td in enumerate(tds):
-            # 枠番の色クラス(is-boatColor)を起点にする
             if td.get('class') and any(c.startswith('is-boatColor') for c in td.get('class')):
                 match = re.search(r'\d+', td.text)
                 if match:
@@ -131,15 +127,12 @@ def parse_beforeinfo(html_text, race_data):
                 break
 
         if b_no and boat_idx != -1 and b_no in race_data["racelist"]:
-            # 【重要】直前情報テーブルの構造:
-            # 枠番[idx] -> 選手名[+1] -> 体重調整[+2] -> チルト[+3] -> 展示タイム[+4]
             if len(tds) > boat_idx + 4:
                 race_data["racelist"][b_no].update({
                     "tilt": extract_float(tds[boat_idx + 3].text),
                     "exhibition_time": extract_float(tds[boat_idx + 4].text)
                 })
 
-    # 3. スタート展示（コース・ST）の取得
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
         b_no_el = div.select_one('.table1_boatImage1Number')
@@ -220,91 +213,72 @@ def parse_all_odds(html_dict, race_data):
                     else:
                         race_data["odds"]["複勝"][b_no] = val
 
-# --- 絶対的除外フィルター (Step 0) の事前判定 ---
+# --- 緩和版：絶対的除外フィルター (Step 0) ---
 def evaluate_ken_conditions(race_data):
     reasons = []
     env = race_data.get("environment", {})
     rl = race_data.get("racelist", {})
     stadium = race_data["metadata"]["stadium"]
     
-    # 展示情報の公開前かどうかのチェック
     valid_ex_times = [d.get("exhibition_time", 0.0) for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
     if len(valid_ex_times) == 0:
         return ["NOT_READY"]
 
-    # 1. データ汚染判定 (1ヶ月以内)
+    # 1. データ汚染判定 (緩和：交換月そのもののみ排除)
     month = int(race_data["metadata"]["date"][4:6])
     motor_month = MOTOR_MONTHS.get(stadium, 1)
     diff_month = month - motor_month
     if diff_month < 0: diff_month += 12
-    if diff_month <= 1:
-        reasons.append(f"データ汚染限界: モーター交換({motor_month}月)から{diff_month}ヶ月のため平滑化未了")
+    if diff_month == 0:  # 1ヶ月以内(<=1)から、交換当月(==0)に緩和
+        reasons.append(f"データ汚染限界: モーター交換({motor_month}月)直後のため平滑化未了")
 
-    # 2. 異常気象・極限流体カオス
+    # 2. 異常気象・極限流体カオス (緩和)
     wind = env.get("wind_speed", 0.0)
     wave = env.get("wave_height", 0.0)
     if wind >= 8.0:
         reasons.append(f"異常気象限界: 風速が8m/s以上 ({wind}m/s)")
-    if stadium == "江戸川" and (wave >= 5.0 or wind >= 5.0):
-        reasons.append(f"極限流体カオス (江戸川): 波高5cm以上または風速5m/s以上")
-    if stadium == "びわこ" and wind >= 4.0:
-        reasons.append(f"極限流体カオス (びわこ): 風速4m/s以上")
+    if stadium == "江戸川" and (wave >= 6.0 or wind >= 7.0): # 5.0 -> 6.0/7.0に緩和
+        reasons.append(f"極限流体カオス (江戸川): 物理的限界値超過")
+    if stadium == "びわこ" and wind >= 5.0: # 4.0 -> 5.0に緩和
+        reasons.append(f"極限流体カオス (びわこ): 風速5m/s以上")
 
-    # 3. 幾何学的カオス (B級4名以上) & 展示欠損
-    b_class_count = 0
-    ex_times = []
-    for b_no, d in rl.items():
-        if d.get("class") in ["B1", "B2", ""]:
-            b_class_count += 1
-        et = d.get("exhibition_time", 0.0)
-        if et == 0.0:
-            reasons.append(f"展示欠損限界: {b_no}号艇の展示タイムが欠損・計測不能")
-        else:
-            ex_times.append(et)
-            
-    if stadium in ["戸田", "尼崎"] and b_class_count >= 4:
-        reasons.append(f"幾何学的カオス誘発 ({stadium}): B級選手が4名以上参戦")
+    # 3. 幾何学的カオス (緩和：B級5名以上)
+    b_class_count = sum(1 for d in rl.values() if d.get("class") in ["B1", "B2", ""])
+    if stadium in ["戸田", "尼崎"] and b_class_count >= 5: # 4 -> 5名に緩和
+        reasons.append(f"幾何学的カオス誘発 ({stadium}): B級選手が5名以上参戦")
 
-    # 4. 住之江特効判定
-    if stadium == "住之江" and ex_times:
+    # 4. 住之江特効判定 (緩和：0.08s)
+    if stadium == "住之江":
+        ex_times = [d["exhibition_time"] for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
         avg_et = sum(ex_times) / len(ex_times)
-        limit_et = 0.03 if env.get("weather") in ["雨", "雪"] else 0.05
+        limit_et = 0.05 if env.get("weather") in ["雨", "雪"] else 0.08 # 0.03/0.05 -> 0.05/0.08に緩和
         for b_no in ["1", "2", "3"]:
             d = rl.get(b_no, {})
             if d.get("class") not in ["A1", "A2"] and d.get("exhibition_time", 0.0) > 0:
                 if (d["exhibition_time"] - avg_et) >= limit_et:
-                    reasons.append(f"極限流体カオス (住之江): {b_no}号艇の展示タイムが平均より{limit_et}秒以上遅延")
+                    reasons.append(f"極限流体カオス (住之江): {b_no}号艇の遅延が許容限界を突破")
 
-    # 5. 前付け・展示スナップショット乖離
+    # 5. 前付け (緩和：1号艇が1コースを守っていればOKとする)
+    if rl.get("1", {}).get("start_course") != 1:
+        reasons.append("初期値崩壊: 1号艇がインコースを奪取されました")
+
+    # 6. 展示スナップショット乖離 (緩和：0.15s / 0.20s)
     for b_no, d in rl.items():
-        if str(d.get("start_course")) != b_no and d.get("start_course") is not None:
-            reasons.append(f"初期値崩壊 (前付け): {b_no}号艇が{d.get('start_course')}コースに進入")
-            
-        st_str = d.get("start_exhibition_st", "")
-        avg_st = d.get("avg_st", 0.15)
-        
-        st_val = 0.25
-        is_f = False
-        if "F" in st_str:
-            is_f = True
-            st_str = st_str.replace("F", "")
-        st_str = st_str.replace("L", "").replace(".", "0.")
+        st_str = d.get("start_exhibition_st", "").replace("F", "").replace("L", "").replace(".", "0.")
         try:
             st_val = float(st_str) if st_str else 0.25
         except ValueError:
-            pass
-            
-        st_val = -st_val if is_f else st_val
+            st_val = 0.25
         
-        diff = abs(st_val - avg_st)
-        limit_st = 0.15 if d.get("class") in ["A1", "A2"] else 0.10
+        diff = abs(st_val - d.get("avg_st", 0.15))
+        limit_st = 0.20 if d.get("class") in ["A1", "A2"] else 0.15 # 0.15/0.10 -> 0.20/0.15に緩和
         if diff >= limit_st:
-            reasons.append(f"展示スナップショット乖離: {b_no}号艇の展示ST({d.get('start_exhibition_st')})と平均ST({avg_st})の差が許容限界を突破")
+            reasons.append(f"展示乖離: {b_no}号艇のSTノイズが限界突破({diff:.2f})")
 
     return list(set(reasons))
 
 # --- UI & 解析ロジック ---
-st.title("🚀 Real-Time Physics Trader v2.2 - Pre-Ken Filter")
+st.title("🚀 Real-Time Physics Trader v2.2 - Balanced Filter")
 
 with st.sidebar:
     st.header("Race Settings")
@@ -346,29 +320,25 @@ if execute:
 
         st.write("🧠 取得したHTMLデータを解析中...")
         
-        if not html_data.get("beforeinfo"):
-            st.error("🚨 直前情報ページのHTML取得に失敗しました。数秒待ってから再度実行してください。")
-
         parse_racelist(html_data.get("racelist"), race_data)
         parse_beforeinfo(html_data.get("beforeinfo"), race_data)
         parse_all_odds(html_data, race_data)
 
         status.update(label="解析準備完了", state="complete")
 
-    # --- 事前「見（ケン）」フィルターの実行とUI表示 ---
+    # --- 事前「見（ケン）」フィルターの実行 ---
     ken_reasons = evaluate_ken_conditions(race_data)
     
     if ken_reasons == ["NOT_READY"]:
-        st.warning("⏳ **【情報未公開】** 直前情報（展示タイム・展示STなど）がまだ公開されていません。レース締切の約20分前以降に再度実行してください。")
+        st.warning("⏳ **【情報未公開】** 直前情報がまだ公開されていません。")
     elif ken_reasons:
-        st.error("🚨 **【AI解析不要 / 見（ケン）推奨レース】** 以下の致命的ノイズが検知されました。")
+        st.error("🚨 **【見（ケン）推奨レース】** 以下の致命的ノイズが検知されました。")
         for r in ken_reasons:
             st.warning(f"・ {r}")
-        st.info("💡 環境ノイズ超過のため、プロンプト節約の観点から別レースを検討してください。")
     else:
-        st.success("✅ **【ノイズクリア】** Step 0のハードリミットを通過しました。AIへ解析を依頼してください。")
+        st.success("✅ **【ノイズクリア】** AIへ解析を依頼してください。")
 
-    # --- JSONダウンロードボタン ---
+    # --- JSONダウンロード ---
     json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
     st.download_button(
         label="📥 AI解析用JSONをダウンロード",
@@ -377,7 +347,7 @@ if execute:
         mime="application/json"
     )
 
-    # --- 物理レポート ---
+    # --- 物理レポート表示 (ここもフル復活) ---
     st.header("🛡️ Physics Analysis Report")
     
     b1 = race_data["racelist"]["1"]
@@ -393,25 +363,24 @@ if execute:
             ex_time = b.get('exhibition_time', 0)
             st.metric(f"{i}号艇", f"{ex_time}s" if ex_time > 0 else "-")
             
-            if ex_time == 0 or ex_time == 0.0:
-                st.caption("⚠️ 展示未取得")
-            else:
+            if ex_time > 0:
                 st.write(f"展示進入: {b.get('start_course', '-')}コース")
                 st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
-            
-            st.caption(f"{b.get('name', '取得エラー')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
-            
-            if ex_time > 0:
+                st.caption(f"{b.get('name', '取得エラー')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
+                
+                # 隣接判定ロジックのUI表示
                 if i < 6:
                     next_b = race_data["racelist"][str(i+1)]
-                    if abs(b.get('avg_st', 0) - next_b.get('avg_st', 0)) >= 0.08:
-                        st.warning("⚠️ Void")
+                    if next_b.get('avg_st'):
+                        if abs(b.get('avg_st', 0) - next_b.get('avg_st', 0)) >= 0.08:
+                            st.warning("⚠️ Void Risk")
                 
                 if i > 1:
                     prev_b = race_data["racelist"][str(i-1)]
-                    diff = prev_b.get('exhibition_time', 0) - b.get('exhibition_time', 0)
-                    if diff >= 0.07: st.error("🌊 Wake Rejection")
-                    elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
+                    if prev_b.get('exhibition_time'):
+                        diff = prev_b.get('exhibition_time', 0) - b.get('exhibition_time', 0)
+                        if diff >= 0.07: st.error("🌊 Wake Rejection")
+                        elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
 
     with st.expander("Raw AI Data を確認"):
         st.json(race_data)
