@@ -27,29 +27,51 @@ def extract_float(text):
 
 # --- スクレイピング・エンジン ---
 
-@st.cache_data(ttl=300) # 5分間キャッシュして無駄なアクセスを減らす
-def fetch_held_stadiums(target_date):
-    """指定した日付に開催しているレース場一覧を取得する"""
+@st.cache_data(ttl=60) # レース進行は早いため、キャッシュは1分間に設定
+def fetch_available_races(target_date):
+    """指定した日付の開催場と、現在投票可能なレース番号（現在〜12R）を取得する"""
     url = f"https://www.boatrace.jp/owpc/pc/race/index?hd={target_date}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         res.raise_for_status()
         res.encoding = 'utf-8'
+        soup = BeautifulSoup(res.text, 'html.parser')
         
-        # HTMLから開催中のレース場名（alt属性）を抽出
-        matches = re.findall(r'<img[^>]+src="/static_extra/pc/images/text_place1_\d{2}\.png"[^>]+alt="([^"]+)"', res.text)
-        
-        # 重複を排除し、JCD_MAPに存在する場のみをリスト化
-        held_stadiums = []
-        for name in matches:
-            clean_name = name.strip()
-            if clean_name in JCD_MAP and clean_name not in held_stadiums:
-                held_stadiums.append(clean_name)
+        available_dict = {}
+        for tbody in soup.select('.table1 tbody'):
+            trs = tbody.find_all('tr')
+            if not trs: continue
+            
+            # 場名取得
+            img_tag = trs[0].select_one('td img')
+            if not img_tag or 'alt' not in img_tag.attrs:
+                continue
+            stadium_name = img_tag['alt'].strip()
+            if stadium_name not in JCD_MAP:
+                continue
                 
-        return held_stadiums
+            text_content = trs[0].text
+            
+            # 「発売終了」や「中止」が含まれる場は除外する
+            if "発売終了" in text_content or "中止" in text_content:
+                continue
+                
+            # 現在の発売中レース番号を探す（例: <td>5R</td>）
+            current_r = 1
+            for td in trs[0].find_all('td'):
+                txt = td.text.strip()
+                m = re.match(r'^(\d{1,2})R$', txt)
+                if m:
+                    current_r = int(m.group(1))
+                    break
+            
+            # 現在のレース番号から12Rまでをリスト化して保存
+            available_dict[stadium_name] = list(range(current_r, 13))
+            
+        return available_dict
     except Exception as e:
-        print(f"開催場取得エラー: {e}")
-        return []
+        print(f"開催データ取得エラー: {e}")
+        return {}
 
 def fetch_html(url, session, retries=3):
     for i in range(retries):
@@ -243,7 +265,6 @@ def evaluate_ken_conditions(race_data):
     if len(valid_ex_times) == 0:
         return ["NOT_READY"]
 
-    # 以前存在した強風、波高、B級戦、前付けなどのフィルターは全て撤廃
     return []
 
 # --- バックテスト用ロギング関数 ---
@@ -285,21 +306,22 @@ st.title("🚀 Real-Time Physics Trader v4.9 - Ultra-Relaxed")
 
 with st.sidebar:
     st.header("Race Settings")
-    
-    # 選択した日付に基づいて、開催中の場を取得
     target_date = st.date_input("日付", datetime.now()).strftime('%Y%m%d')
-    held_stadiums = fetch_held_stadiums(target_date)
     
-    # 開催場がない場合は全ての場を選択可能にしておく（保険用）
-    display_stadiums = held_stadiums if held_stadiums else list(JCD_MAP.keys())
+    # 選択した日付に基づいて、開催中（発売中）の場とレース番号を取得
+    available_races_dict = fetch_available_races(target_date)
     
-    input_jcd = st.selectbox("開催場", display_stadiums)
-    
-    if not held_stadiums:
-        st.caption("※開催データを取得できなかったため全場を表示しています")
+    if available_races_dict:
+        # すでに全レース終了した場はここには含まれない
+        input_jcd = st.selectbox("開催場", list(available_races_dict.keys()))
+        # 選んだ場に応じて、現在〜12Rの選択肢を動的に表示する
+        target_rno = st.selectbox("レース番号(R)", available_races_dict[input_jcd])
+    else:
+        # 深夜や早朝など、データが取得できない場合のフォールバック
+        st.caption("※現在発売中のデータが取得できないため、全場・全レースを表示しています")
+        input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
+        target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
         
-    target_rno = st.number_input("レース番号(R)", 1, 12, 12)
-    
     execute = st.button("物理解析エンジン 起動")
 
 if execute:
