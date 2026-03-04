@@ -1,11 +1,14 @@
 """
-RTPT v6.1 — True Market Alpha + Kelly Criterion Engine (Module)
+RTPT v6.3 — True Market Alpha + Kelly Criterion Engine (Module)
 Reusable analysis function for both CLI and Streamlit integration.
+Alpha source: Wall Decay (Slit Void Exploitation) ONLY.
+All public-information alphas (exhibition time, wind) removed as double-counting.
 """
 import math
 import itertools
 
 EV_THRESHOLD = 1.50
+CONCENTRATION_THRESHOLD = 0.60  # Kelly%がこれを超えたら1点集中推奨
 
 def analyze(race_data, bankroll=1000):
     """
@@ -13,7 +16,7 @@ def analyze(race_data, bankroll=1000):
     Returns a dict with:
       - "boats": list of per-boat analysis dicts
       - "targets": list of investment target dicts (sorted by EV desc)
-      - "summary": summary stats dict
+      - "summary": summary stats dict (includes concentration_mode flag)
       - "error": error string if any
     """
     racelist = race_data.get("racelist", {})
@@ -21,20 +24,30 @@ def analyze(race_data, bankroll=1000):
     odds_data = race_data.get("odds", {})
 
     # --- Validation ---
+    # NOTE: exhibition_time must be > 0, not just truthy (0.0 is falsy in Python)
     for k, b in racelist.items():
-        if not b.get("exhibition_time") or not b.get("start_exhibition_st"):
+        if b.get("exhibition_time", 0) <= 0 or not b.get("start_exhibition_st"):
             return {"error": "展示データ欠損のため解析不可", "boats": [], "targets": [], "summary": {}}
 
     # Parse Exhibition Start Timing
+    # ".08" → "0.08", "F.01" → -0.01, "L" → 0.25
+    # JSONにparsed_stが既に存在する場合は数値として読み直す（型を保証）
     for k, b in racelist.items():
-        st_str = str(b["start_exhibition_st"])
-        if "F" in st_str:
-            f_val = float(st_str.replace("F.", "0."))
-            b["parsed_st"] = -f_val
-        elif "L" in st_str:
-            b["parsed_st"] = 0.25
-        else:
-            b["parsed_st"] = float(st_str.replace(".", "0."))
+        if "parsed_st" in b:
+            b["parsed_st"] = float(b["parsed_st"])
+            continue
+        st_str = str(b.get("start_exhibition_st", "0.10")).strip()
+        try:
+            if "F" in st_str.upper():
+                b["parsed_st"] = -float(st_str.upper().replace("F", "").replace(".", "0.") or "0")
+            elif "L" in st_str.upper():
+                b["parsed_st"] = 0.25
+            elif st_str.startswith("."):
+                b["parsed_st"] = float("0" + st_str)
+            else:
+                b["parsed_st"] = float(st_str)
+        except ValueError:
+            b["parsed_st"] = 0.10  # フォールバック
 
     # === Step 1: True Market Probability (TMP) ===
     raw_tmp = {}
@@ -54,32 +67,18 @@ def analyze(race_data, bankroll=1000):
     alpha_dict = {i: 1.0 for i in range(1, 7)}
     alpha_reasons = {i: [] for i in range(1, 7)}
 
-    # 2-A: Exhibition Time Deviation Alpha
-    for k, b in racelist.items():
-        boat_id = int(k)
-        time_diff = avg_exh_time - b.get("exhibition_time", avg_exh_time)
-        adj = time_diff * 3.0
-        if abs(adj) > 0.01:
-            alpha_dict[boat_id] += adj
-            alpha_reasons[boat_id].append(f"ExhTime({time_diff*1000:+.0f}ms→α{adj:+.3f})")
+    # 2-A: Exhibition Time Alpha — 削除 (v6.2)
+    # 理由: 展示タイムは市場参加者全員が見ている公開情報である。
+    # TMP（単勝オッズ）にはすでに展示タイムの評価が完全に織り込まれているため、
+    # ここで再度アルファとして加算すると「二重取り」となり、
+    # 我々の唯一の真のエッジ（Wall Decay）を汚染する。
+    # 真のクオンツは「市場が見ていない情報だけ」をアルファにする。
 
-    # 2-B: Wind Direction Alpha
-    wind_dir = env.get("wind_direction", "")
-    wind_speed = env.get("wind_speed", 0)
-    if wind_speed >= 2.0:
-        if "追い風" in str(wind_dir):
-            for i in [4, 5, 6]:
-                alpha_dict[i] *= 1.1
-                alpha_reasons[i].append(f"追い風{wind_speed}m(α×1.1)")
-            for i in [1, 2]:
-                alpha_dict[i] *= 0.95
-                alpha_reasons[i].append(f"追い風{wind_speed}m(α×0.95)")
-        elif "向かい風" in str(wind_dir):
-            for i in [1, 2]:
-                alpha_dict[i] *= 1.05
-                alpha_reasons[i].append(f"向かい風{wind_speed}m(α×1.05)")
+    # 2-B: Wind Direction Alpha — 削除 (v6.3)
+    # 理由: 風向き・風速はboatrace.jpに公開されており全市場参加者が見ている。
+    # TMP（単勝オッズ）にすでに完全に織り込まれているため二重取りになる。
 
-    # 2-C: Wall Decay / Slit Void Exploitation
+    # 2-C: Wall Decay / Slit Void Exploitation（唯一の真のエッジ）
     wd_dict = {i: 12.0 for i in range(1, 7)}
     for i in range(1, 6):
         inner_st = racelist[str(i)].get("parsed_st", 0.1)
@@ -169,10 +168,46 @@ def analyze(race_data, bankroll=1000):
         kelly_fractions.append(kelly_f)
 
     total_kelly = sum(kelly_fractions)
+    
+    # Kelly配分を算出し、合計がバンクロールを超えないよう正規化する
+    raw_yen = []
     for i, t in enumerate(investment_targets):
         pct = (kelly_fractions[i] / total_kelly * 100) if total_kelly > 0 else 0
         t["kelly_pct"] = pct
-        t["recommended_yen"] = max(100, round(bankroll * pct / 100 / 100) * 100)
+        raw_yen.append(bankroll * pct / 100)
+    
+    # === Step 7: Concentration Mode Detection ===
+    # 最上位買い目のKelly割合が全体の60%を超える場合は「1点集中推奨」とする
+    # 数学的根拠: 複数の相関した買い目に分散するより、最大EVの1点に全額投下する方が
+    # 期待ログ成長率が高くなる局面がある。
+    concentration_mode = False
+    if kelly_fractions and total_kelly > 0:
+        top_kelly_ratio = kelly_fractions[0] / total_kelly
+        if top_kelly_ratio >= CONCENTRATION_THRESHOLD:
+            concentration_mode = True
+            # 集中モード: 1位の買い目にバンクロール全額を推奨
+            for i, t in enumerate(investment_targets):
+                if i == 0:
+                    t["recommended_yen"] = bankroll
+                    t["concentration"] = True
+                else:
+                    t["recommended_yen"] = 0  # 購入しない
+                    t["concentration"] = False
+        else:
+            # 分散モード: 100円単位に丸め、合計がバンクロールを超えないよう調整
+            concentration_mode = False
+            total_raw = sum(raw_yen)
+            for i, t in enumerate(investment_targets):
+                if total_raw > 0:
+                    normalized = raw_yen[i] / total_raw * bankroll
+                else:
+                    normalized = 0
+                t["recommended_yen"] = max(100, round(normalized / 100) * 100)
+                t["concentration"] = False
+    else:
+        for i, t in enumerate(investment_targets):
+            t["recommended_yen"] = 100
+            t["concentration"] = False
 
     summary = {}
     if investment_targets:
@@ -181,9 +216,11 @@ def analyze(race_data, bankroll=1000):
             "avg_ev": sum(t["ev"] for t in investment_targets) / len(investment_targets),
             "max_ev": investment_targets[0]["ev"],
             "max_ev_combo": investment_targets[0]["combo"],
-            "verdict": "投資実行"
+            "verdict": "投資実行",
+            "concentration_mode": concentration_mode,
+            "top_kelly_ratio": (kelly_fractions[0] / total_kelly) if (kelly_fractions and total_kelly > 0) else 0
         }
     else:
-        summary = {"count": 0, "avg_ev": 0, "max_ev": 0, "max_ev_combo": "", "verdict": "見（ケン）"}
+        summary = {"count": 0, "avg_ev": 0, "max_ev": 0, "max_ev_combo": "", "verdict": "見（ケン）", "concentration_mode": False, "top_kelly_ratio": 0}
 
     return {"error": None, "boats": boats, "targets": investment_targets, "summary": summary}
