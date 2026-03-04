@@ -8,9 +8,10 @@ import os
 from bs4 import BeautifulSoup
 from datetime import datetime
 import concurrent.futures
+from rtpt_engine import analyze  # v6.1 Engine Integration
 
 # --- 初期設定 ---
-st.set_page_config(page_title="Real-Time Physics Trader v4.9 - Ultra-Relaxed", layout="wide")
+st.set_page_config(page_title="RTPT v6.1 — True Market Alpha Trader", layout="wide")
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
@@ -25,51 +26,31 @@ def extract_float(text):
     m = re.search(r'-?[\d\.]+', str(text))
     return float(m.group()) if m else 0.0
 
-# --- スクレイピング・エンジン ---
+# --- スクレイピング・エンジン (既存ロジック) ---
 
-@st.cache_data(ttl=60) # レース進行は早いため、キャッシュは1分間に設定
+@st.cache_data(ttl=60)
 def fetch_available_races(target_date):
-    """指定した日付の開催場と、現在投票可能なレース番号（現在〜12R）を確実に取得する"""
     url = f"https://www.boatrace.jp/owpc/pc/race/index?hd={target_date}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         res.raise_for_status()
         res.encoding = 'utf-8'
         html_text = res.text
-        
         available_dict = {}
-        
-        # HTML全体から <tbody> 単位のブロックを抽出
         tbodies = re.finditer(r'<tbody.*?>.*?</tbody>', html_text, re.DOTALL)
-        
         for match in tbodies:
             tbody_html = match.group(0)
-            
-            # 場名（alt属性）の抽出
             stadium_match = re.search(r'alt="([^"]+)"', tbody_html)
-            if not stadium_match:
-                continue
-            
+            if not stadium_match: continue
             stadium_name = stadium_match.group(1).strip()
-            if stadium_name not in JCD_MAP:
-                continue
-                
-            # 「最終Ｒ発売終了」または「中止」が含まれる場は除外
-            if "最終Ｒ発売終了" in tbody_html or "中止" in tbody_html:
-                continue
-                
-            # 現在の発売中レース番号を探す（<td>5R</td> のようなパターン）
+            if stadium_name not in JCD_MAP: continue
+            if "最終Ｒ発売終了" in tbody_html or "中止" in tbody_html: continue
             current_r = 1
             r_match = re.search(r'>(\d{1,2})R<', tbody_html)
-            if r_match:
-                current_r = int(r_match.group(1))
-            
-            # 1R〜12Rのうち、現在のレース以降をリスト化して保存
+            if r_match: current_r = int(r_match.group(1))
             available_dict[stadium_name] = list(range(current_r, 13))
-            
         return available_dict
     except Exception as e:
-        print(f"開催データ取得エラー: {e}")
         return {}
 
 def fetch_html(url, session, retries=3):
@@ -80,8 +61,7 @@ def fetch_html(url, session, retries=3):
             res.encoding = 'utf-8'
             return res.text
         except Exception:
-            if i == retries - 1:
-                return ""
+            if i == retries - 1: return ""
             time.sleep(1)
 
 def parse_racelist(html_text, race_data):
@@ -93,40 +73,29 @@ def parse_racelist(html_text, race_data):
         if not trs: continue
         tds = trs[0].find_all('td')
         if len(tds) < 8: continue
-        
         b_no_raw = tds[0].text.strip()
         b_no_match = re.search(r'[1-6１-６]', b_no_raw)
         if not b_no_match: continue
         b_no = str(int(b_no_match.group().translate(str.maketrans('１２３４５６', '123456'))))
-
         class_info_div = tbody.select_one('div.is-fs11')
         rank = ""
         if class_info_div:
             rank_span = class_info_div.select_one('span')
-            if rank_span:
-                rank = rank_span.text.strip()
-
-        name = tbody.select_one('.is-fs18.is-fBold').text.strip().replace('\u3000', ' ')
-        
+            if rank_span: rank = rank_span.text.strip()
+        name_el = tbody.select_one('.is-fs18.is-fBold')
+        name = name_el.text.strip().replace('\u3000', ' ') if name_el else ""
         weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
         weight = float(weight_match.group(1)) if weight_match else 0.0
-
         st_txt = [x.strip() for x in tds[3].get_text(separator='\n').split('\n') if x.strip()]
-        
-        # --- 勝率データの抽出 (全国:tds[4], 当地:tds[5]) ---
         nat_win_txt = [x.strip() for x in tds[4].get_text(separator='\n').split('\n') if x.strip()]
         loc_win_txt = [x.strip() for x in tds[5].get_text(separator='\n').split('\n') if x.strip()]
-        
         mot = [x.strip() for x in tds[6].get_text(separator='\n').split('\n') if x.strip()]
-        
         race_data["racelist"][b_no].update({
-            "name": name, 
-            "class": rank, 
-            "weight": weight, 
+            "name": name, "class": rank, "weight": weight,
             "win_rate_national": extract_float(nat_win_txt[0]) if nat_win_txt else 0.0,
             "win_rate_local": extract_float(loc_win_txt[0]) if loc_win_txt else 0.0,
             "motor_no": mot[0] if mot else '-',
-            "motor_2ren": extract_float(mot[1]) if len(mot)>1 else 30.0, 
+            "motor_2ren": extract_float(mot[1]) if len(mot) > 1 else 30.0,
             "avg_st": extract_float(st_txt[-1]) if st_txt else 0.15
         })
 
@@ -134,7 +103,6 @@ def parse_beforeinfo(html_text, race_data):
     if not html_text: return
     soup = BeautifulSoup(html_text, 'html.parser')
     env = race_data["environment"]
-    
     t_el = soup.select_one('.is-temperature .weather1_bodyUnitLabelData')
     if t_el: env['temperature'] = extract_float(t_el.text)
     w_el = soup.select_one('.is-weather .weather1_bodyUnitLabelTitle')
@@ -145,7 +113,6 @@ def parse_beforeinfo(html_text, race_data):
     if wt_el: env['water_temp'] = extract_float(wt_el.text)
     wh_el = soup.select_one('.is-wave .weather1_bodyUnitLabelData')
     if wh_el: env['wave_height'] = extract_float(wh_el.text)
-
     wd_img = soup.select_one('.is-windDirection .weather1_bodyUnitImage')
     if wd_img and wd_img.has_attr('class'):
         for cls in wd_img['class']:
@@ -154,32 +121,24 @@ def parse_beforeinfo(html_text, race_data):
                     num = int(cls.replace('is-wind', ''))
                     dir_map = {i: "追い風" if i in [1,2,3,4,14,15,16] else "横風" if i in [5,13] else "向かい風" for i in range(1,17)}
                     env['wind_direction'] = dir_map.get(num, "無風")
-                except ValueError:
-                    pass
+                except ValueError: pass
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
-
     for tbody in soup.select('.table1 tbody'):
         trs = tbody.find_all('tr')
         if not trs: continue
         tds = trs[0].find_all('td')
-        
-        b_no = None
-        boat_idx = -1
+        b_no = None; boat_idx = -1
         for i, td in enumerate(tds):
             if td.get('class') and any(c.startswith('is-boatColor') for c in td.get('class')):
                 match = re.search(r'\d+', td.text)
-                if match:
-                    b_no = match.group()
-                    boat_idx = i
+                if match: b_no = match.group(); boat_idx = i
                 break
-
         if b_no and boat_idx != -1 and b_no in race_data["racelist"]:
             if len(tds) > boat_idx + 4:
                 race_data["racelist"][b_no].update({
                     "tilt": extract_float(tds[boat_idx + 3].text),
                     "exhibition_time": extract_float(tds[boat_idx + 4].text)
                 })
-
     st_ex_divs = soup.select('.table1_boatImage1')
     for course_idx, div in enumerate(st_ex_divs, 1):
         b_no_el = div.select_one('.table1_boatImage1Number')
@@ -190,10 +149,7 @@ def parse_beforeinfo(html_text, race_data):
                 b_no = b_no_match.group()
                 st_val = st_time_el.text.strip()
                 if b_no in race_data["racelist"]:
-                    race_data["racelist"][b_no].update({
-                        "start_course": course_idx,
-                        "start_exhibition_st": st_val
-                    })
+                    race_data["racelist"][b_no].update({"start_course": course_idx, "start_exhibition_st": st_val})
 
 def parse_all_odds(html_dict, race_data):
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
@@ -203,7 +159,6 @@ def parse_all_odds(html_dict, race_data):
         tbs = soup.select('tbody.is-p3-0')
         if otype == 'odds3t': key, sep = '3連単', '-'
         elif otype == 'odds3f': key, sep = '3連複', '='
-        
         if 'odds3' in otype:
             tb = tbs[0] if tbs else None
             if not tb: continue
@@ -229,7 +184,6 @@ def parse_all_odds(html_dict, race_data):
                         for c in range(6):
                             if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                                 race_data["odds"][k][f"{c+1}{s}{tds[c*2].text.strip()}"] = extract_float(tds[c*2+1].text)
-
     html_k = html_dict.get('oddsk')
     if html_k:
         tbk = BeautifulSoup(html_k, 'html.parser').select_one('tbody.is-p3-0')
@@ -239,7 +193,6 @@ def parse_all_odds(html_dict, race_data):
                 for c in range(6):
                     if c*2+1 < len(tds) and "is-disabled" not in tds[c*2].get('class', []):
                         race_data["odds"]["拡連複"][f"{c+1}={tds[c*2].text.strip()}"] = tds[c*2+1].text.strip()
-
     html_tf = html_dict.get('oddstf')
     if html_tf:
         soup_tf = BeautifulSoup(html_tf, 'html.parser')
@@ -252,89 +205,37 @@ def parse_all_odds(html_dict, race_data):
             for tr in unit.select('table tbody tr'):
                 tds = tr.select('td')
                 if len(tds) < 3: continue
-                b_no = tds[0].text.strip()
-                val = tds[2].text.strip()
+                b_no = tds[0].text.strip(); val = tds[2].text.strip()
                 if "is-disabled" not in tds[2].get('class', []):
-                    if mode == "単勝":
-                        race_data["odds"]["単勝"][b_no] = extract_float(val)
-                    else:
-                        race_data["odds"]["複勝"][b_no] = val
+                    if mode == "単勝": race_data["odds"]["単勝"][b_no] = extract_float(val)
+                    else: race_data["odds"]["複勝"][b_no] = val
 
-# --- 超・緩和版：絶対的除外フィルター (Step 0) ---
-def evaluate_ken_conditions(race_data):
-    rl = race_data.get("racelist", {})
-    
-    # 直前情報（展示タイム）が公開されているかチェック
-    valid_ex_times = [d.get("exhibition_time", 0.0) for d in rl.values() if d.get("exhibition_time", 0.0) > 0]
-    if len(valid_ex_times) == 0:
-        return ["NOT_READY"]
-
-    return []
-
-# --- バックテスト用ロギング関数 ---
-def log_race_data_to_csv(race_data, ken_reasons):
-    log_file = "rtpt_backtest_log.csv"
-    file_exists = os.path.isfile(log_file)
-    
-    env = race_data.get("environment", {})
-    rl = race_data.get("racelist", {})
-    meta = race_data.get("metadata", {})
-    
-    log_row = {
-        "date": meta.get("date"),
-        "stadium": meta.get("stadium"),
-        "race_number": meta.get("race_number"),
-        "wind_speed": env.get("wind_speed", 0.0),
-        "wave_height": env.get("wave_height", 0.0),
-        "ken_filter_passed": "Yes" if not ken_reasons else "No",
-        "ken_reasons": " | ".join(ken_reasons) if ken_reasons else ""
-    }
-    
-    for i in range(1, 7):
-        b = rl.get(str(i), {})
-        log_row[f"boat{i}_class"] = b.get("class", "")
-        log_row[f"boat{i}_win_national"] = b.get("win_rate_national", 0.0) # 追加
-        log_row[f"boat{i}_win_local"] = b.get("win_rate_local", 0.0)       # 追加
-        log_row[f"boat{i}_motor2ren"] = b.get("motor_2ren", 0.0)
-        log_row[f"boat{i}_ex_time"] = b.get("exhibition_time", 0.0)
-        log_row[f"boat{i}_avg_st"] = b.get("avg_st", 0.0)
-        log_row[f"boat{i}_ex_st"] = b.get("start_exhibition_st", "")
-    
-    fieldnames = list(log_row.keys())
-    with open(log_file, mode="a", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(log_row)
-
-# --- UI & 解析ロジック ---
-st.title("🚀 Real-Time Physics Trader v4.9 - Ultra-Relaxed")
+# ============================================================
+# UI
+# ============================================================
+st.title("🎯 RTPT v6.1 — True Market Alpha Trader")
+st.caption("ボタン1つで「データ取得 → 物理解析 → Kelly投資判断」を即座に実行")
 
 with st.sidebar:
-    st.header("Race Settings")
+    st.header("⚙️ Settings")
     target_date = st.date_input("日付", datetime.now()).strftime('%Y%m%d')
+    bankroll = st.number_input("💰 バンクロール（円）", min_value=100, value=1000, step=100)
     
-    # 選択した日付に基づいて、開催中（発売中）の場とレース番号を取得
     available_races_dict = fetch_available_races(target_date)
-    
     if available_races_dict:
-        # すでに全レース終了した場はここには含まれない
         stadiums = list(available_races_dict.keys())
         if stadiums:
-            input_jcd = st.selectbox("開催場", stadiums)
-            # 選んだ場に応じて、現在〜12Rの選択肢を動的に表示する
-            target_rno = st.selectbox("レース番号(R)", available_races_dict[input_jcd])
+            input_jcd = st.selectbox("🏟️ 開催場", stadiums)
+            target_rno = st.selectbox("🏁 レース番号(R)", available_races_dict[input_jcd])
         else:
-            st.caption("※本日の全レースが終了しているか、データが取得できません。")
+            st.caption("※全レース終了")
             input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
             target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
     else:
-        # 夜間や全レース終了後など、データが取得できない場合のフォールバック
-        st.caption("※現在発売中のデータが取得できないため、全場・全レースを表示しています")
         input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
         target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
-        
-    execute = st.button("物理解析エンジン 起動")
+    
+    execute = st.button("🚀 解析エンジン起動", type="primary", use_container_width=True)
 
 if execute:
     target_jcd = JCD_MAP[input_jcd]
@@ -344,8 +245,9 @@ if execute:
         "odds": {"3連単": {}, "3連複": {}, "2連単": {}, "2連複": {}, "拡連複": {}, "単勝": {}, "複勝": {}}
     }
 
-    with st.status("同期中...", expanded=True) as status:
-        st.write("🌐 通信セッションを確立し、7つのページを並列取得中...")
+    # === Phase 1: Scrape ===
+    with st.status("📡 データ取得中...", expanded=True) as status:
+        st.write("7ページを並列取得中...")
         base_url = "https://www.boatrace.jp/owpc/pc/race"
         urls = {
             "racelist": f"{base_url}/racelist?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
@@ -356,84 +258,78 @@ if execute:
             "oddsk": f"{base_url}/oddsk?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
             "oddstf": f"{base_url}/oddstf?rno={target_rno}&jcd={target_jcd}&hd={target_date}"
         }
-
         html_data = {}
         session = requests.Session()
         session.headers.update(HEADERS)
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
             future_to_key = {executor.submit(fetch_html, url, session): key for key, url in urls.items()}
             for future in concurrent.futures.as_completed(future_to_key):
-                key = future_to_key[future]
-                html_data[key] = future.result()
-
-        st.write("🧠 取得したHTMLデータを解析中...")
+                html_data[future_to_key[future]] = future.result()
         
+        st.write("HTMLを解析中...")
         parse_racelist(html_data.get("racelist"), race_data)
         parse_beforeinfo(html_data.get("beforeinfo"), race_data)
         parse_all_odds(html_data, race_data)
+        status.update(label="✅ データ取得完了", state="complete")
 
-        status.update(label="解析準備完了", state="complete")
+    # === Phase 2: v6.1 Engine Analysis ===
+    result = analyze(race_data, bankroll)
 
-    # --- v4.9 超緩和フィルターの実行 ---
-    ken_reasons = evaluate_ken_conditions(race_data)
-    
-    if ken_reasons == ["NOT_READY"]:
-        st.warning("⏳ **【情報未公開】** 直前情報がまだ公開されていません。展示航走終了後に再度実行してください。")
+    if result.get("error"):
+        st.warning(f"⏳ {result['error']}")
     else:
-        st.success("✅ **【データ取得完了】** 直前情報取得済み。ノイズも丸ごとAIへ解析を依頼してください。")
+        # --- 物理アルファ表示 ---
+        st.header(f"🧠 {input_jcd} {target_rno}R — 物理アルファ解析")
+        cols = st.columns(6)
+        for boat_info in result["boats"]:
+            with cols[boat_info["boat"] - 1]:
+                delta = boat_info["post_prob"] - boat_info["tmp"]
+                st.metric(
+                    f"{boat_info['boat']}号艇",
+                    f"{boat_info['post_prob']*100:.1f}%",
+                    f"{delta*100:+.1f}%",
+                    delta_color="normal" if delta >= 0 else "inverse"
+                )
+                st.caption(f"{boat_info['name']}")
+                st.caption(f"TMP:{boat_info['tmp']*100:.1f}% α:{boat_info['alpha']:.3f}")
+                if boat_info["wd"] < 12.0:
+                    st.error(f"⚠️ WD:{boat_info['wd']:.0f}")
+                for r in boat_info["reasons"]:
+                    st.caption(f"📐 {r}")
 
-    # バックテスト用データの書き出し
-    if ken_reasons != ["NOT_READY"]:
-        log_race_data_to_csv(race_data, ken_reasons)
-
-    # --- JSONダウンロード ---
-    json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
-    st.download_button(
-        label="📥 AI解析用JSONをダウンロード",
-        data=json_export,
-        file_name=f"{target_date}_{input_jcd}_{target_rno}R_AIデータ.json",
-        mime="application/json"
-    )
-
-    # --- 物理レポート表示 ---
-    st.header("🛡️ Physics Analysis Report")
-    
-    b1 = race_data["racelist"]["1"]
-    if b1.get('exhibition_time', 0) > 0:
-        ex_times = [race_data["racelist"][str(i)].get('exhibition_time', 0) for i in range(1,7) if race_data["racelist"][str(i)].get('exhibition_time', 0) > 0]
-        if ex_times and b1.get('exhibition_time', 0) == max(ex_times):
-            st.error("📉 Conditional Renormalization: 1号艇の展示タイムに懸念あり（全艇中最遅）")
-
-    cols = st.columns(6)
-    for i in range(1, 7):
-        b = race_data["racelist"][str(i)]
-        with cols[i-1]:
-            ex_time = b.get('exhibition_time', 0)
-            st.metric(f"{i}号艇", f"{ex_time}s" if ex_time > 0 else "-")
+        # --- 投資判断テーブル ---
+        st.header("💰 投資判断テーブル (Kelly Criterion)")
+        summary = result["summary"]
+        
+        if summary["verdict"] == "見（ケン）":
+            st.error("🛑 **【判定: 見（ケン）】** EV 1.50以上の投資対象なし。本レースは完全見送り。")
+        else:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("投資対象", f"{summary['count']}点")
+            col2.metric("平均EV", f"{summary['avg_ev']:.2f}")
+            col3.metric("最大EV", f"{summary['max_ev']:.2f}", f"{summary['max_ev_combo']}")
             
-            if ex_time > 0:
-                # --- 勝率データの表示を追加 ---
-                st.write(f"🚩 全国: {b.get('win_rate_national', 0.0):.2f}")
-                st.write(f"📍 当地: {b.get('win_rate_local', 0.0):.2f}")
-                
-                st.write(f"展示進入: {b.get('start_course', '-')}コース")
-                st.write(f"展示ST: {b.get('start_exhibition_st', '-')}")
-                st.caption(f"{b.get('name', '取得エラー')} ({b.get('class', '-')}) / {b.get('weight', 0.0)}kg")
-                
-                # 隣接判定ロジックのUI表示
-                if i < 6:
-                    next_b = race_data["racelist"][str(i+1)]
-                    if next_b.get('avg_st'):
-                        if abs(b.get('avg_st', 0) - next_b.get('avg_st', 0)) >= 0.08:
-                            st.warning("⚠️ Void Risk")
-                
-                if i > 1:
-                    prev_b = race_data["racelist"][str(i-1)]
-                    if prev_b.get('exhibition_time'):
-                        diff = prev_b.get('exhibition_time', 0) - b.get('exhibition_time', 0)
-                        if diff >= 0.07: st.error("🌊 Wake Rejection")
-                        elif diff <= 0.06 and b.get('class') == 'A1': st.success("⚡ Skill Offset")
-
-    with st.expander("Raw AI Data を確認"):
+            # Table
+            table_data = []
+            for t in result["targets"]:
+                table_data.append({
+                    "券種": t["type"],
+                    "買い目": t["combo"],
+                    "推定確率": f"{t['prob']*100:.1f}%",
+                    "オッズ": f"{t['odds']:.1f}倍",
+                    "EV": f"{t['ev']:.2f}",
+                    "Kelly%": f"{t['kelly_pct']:.1f}%",
+                    "推奨額": f"{t['recommended_yen']}円"
+                })
+            st.dataframe(table_data, use_container_width=True, hide_index=True)
+    
+    # --- JSON Download (backup) ---
+    with st.expander("📥 JSONデータ（バックアップ）"):
+        json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="JSONダウンロード",
+            data=json_export,
+            file_name=f"{target_date}_{input_jcd}_{target_rno}R_AIデータ.json",
+            mime="application/json"
+        )
         st.json(race_data)
