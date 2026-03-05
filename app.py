@@ -275,6 +275,34 @@ if execute:
     # === Phase 2: v6.3 Engine Analysis ===
     result = analyze(race_data, bankroll)
 
+    # === Phase 3: 予想ログ自動保存 ===
+    LOG_FILE = "predictions_log.csv"
+    if not result.get("error") and result.get("targets"):
+        log_exists = os.path.isfile(LOG_FILE)
+        with open(LOG_FILE, mode="a", encoding="utf-8-sig", newline="") as f:
+            fieldnames = ["date", "stadium", "race", "type", "combo",
+                          "prob_pct", "odds", "ev", "kelly_pct", "recommended_yen",
+                          "result_1st", "result_2nd", "result_3rd", "hit", "payout"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not log_exists:
+                writer.writeheader()
+            for t in result["targets"]:
+                writer.writerow({
+                    "date": target_date,
+                    "stadium": input_jcd,
+                    "race": f"{target_rno}R",
+                    "type": t["type"],
+                    "combo": t["combo"],
+                    "prob_pct": f"{t['prob']*100:.1f}",
+                    "odds": t["odds"],
+                    "ev": f"{t['ev']:.2f}",
+                    "kelly_pct": f"{t['kelly_pct']:.1f}",
+                    "recommended_yen": t["recommended_yen"],
+                    "result_1st": "", "result_2nd": "", "result_3rd": "",
+                    "hit": "", "payout": ""
+                })
+        st.toast(f"✅ 予想ログを {LOG_FILE} に保存しました", icon="📝")
+
     if result.get("error"):
         st.warning(f"⏳ {result['error']}")
     else:
