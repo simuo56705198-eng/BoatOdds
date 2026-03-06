@@ -6,8 +6,12 @@ All public-information alphas (exhibition time, wind) removed as double-counting
 """
 import math
 import itertools
+import re
 
 EV_THRESHOLD = 1.50
+TRIFECTA_EV_THRESHOLD = 2.0     # 3連単/3連複の最低EV（より厳しい）
+TRIFECTA_MIN_PROB_EXACTA = 0.03  # 3連単：最低確率3%（低確率の長打ちを除外）
+TRIFECTA_MIN_PROB_COMBO = 0.08   # 3連複：最低確率8%（上位3着の確度が高い時のみ）
 CONCENTRATION_THRESHOLD = 0.60  # Kelly%がこれを超えたら1点集中推奨
 
 def analyze(race_data, bankroll=1000):
@@ -39,7 +43,13 @@ def analyze(race_data, bankroll=1000):
         st_str = str(b.get("start_exhibition_st", "0.10")).strip()
         try:
             if "F" in st_str.upper():
-                b["parsed_st"] = -float(st_str.upper().replace("F", "").replace(".", "0.") or "0")
+                raw = re.sub(r'[Ff]', '', st_str).strip()
+                if not raw or raw == '.':
+                    b["parsed_st"] = 0.0
+                elif raw.startswith('.'):
+                    b["parsed_st"] = -float('0' + raw)
+                else:
+                    b["parsed_st"] = -float(raw)
             elif "L" in st_str.upper():
                 b["parsed_st"] = 0.25
             elif st_str.startswith("."):
@@ -63,7 +73,6 @@ def analyze(race_data, bankroll=1000):
     tmp_dict = {k: v / total_raw_tmp for k, v in raw_tmp.items()}
 
     # === Step 2: Physics Alpha ===
-    avg_exh_time = sum(b.get("exhibition_time", 6.8) for b in racelist.values()) / 6
     alpha_dict = {i: 1.0 for i in range(1, 7)}
     alpha_reasons = {i: [] for i in range(1, 7)}
 
@@ -153,6 +162,30 @@ def analyze(race_data, bankroll=1000):
                 if ev >= EV_THRESHOLD:
                     investment_targets.append({"type": "拡連複", "combo": k, "prob": est_prob, "odds": min_odds, "ev": ev})
             except:
+                pass
+
+    # 3連単: EV >= 2.0 かつ 推定確率 >= 3% の時のみ（自信がある買い目に限定）
+    if "3連単" in odds_data:
+        for k, odds in odds_data["3連単"].items():
+            try:
+                first, second, third = map(int, k.split('-'))
+                est_prob = harville_probs.get((first, second, third), 0.0)
+                ev = est_prob * float(odds)
+                if ev >= TRIFECTA_EV_THRESHOLD and est_prob >= TRIFECTA_MIN_PROB_EXACTA:
+                    investment_targets.append({"type": "3連単", "combo": k, "prob": est_prob, "odds": float(odds), "ev": ev})
+            except (ValueError, KeyError):
+                pass
+
+    # 3連複: EV >= 1.8 かつ 推定確率 >= 8% の時のみ（上位3艇の確度が高い時のみ）
+    if "3連複" in odds_data:
+        for k, odds in odds_data["3連複"].items():
+            try:
+                boats_combo = list(map(int, k.split('=')))
+                est_prob = sum(harville_probs[p] for p in itertools.permutations(boats_combo, 3))
+                ev = est_prob * float(odds)
+                if ev >= TRIFECTA_EV_THRESHOLD and est_prob >= TRIFECTA_MIN_PROB_COMBO:
+                    investment_targets.append({"type": "3連複", "combo": k, "prob": est_prob, "odds": float(odds), "ev": ev})
+            except (ValueError, KeyError):
                 pass
 
     investment_targets.sort(key=lambda x: x["ev"], reverse=True)

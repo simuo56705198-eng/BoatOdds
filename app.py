@@ -166,11 +166,12 @@ def parse_all_odds(html_dict, race_data):
             for row in tb.select('tr'):
                 tds = row.find_all('td'); idx = 0
                 for c in range(6):
-                    if idx >= len(tds): break
                     if rem_row[c] == 0:
+                        if idx + 2 >= len(tds): break
                         snd_td, trd_td, o_td = tds[idx], tds[idx+1], tds[idx+2]; idx += 3
                         cur_snd[c], rem_row[c] = snd_td, int(snd_td.get('rowspan', 1))
                     else:
+                        if idx + 1 >= len(tds): break
                         trd_td, o_td = tds[idx], tds[idx+1]; idx += 2; snd_td = cur_snd[c]
                     rem_row[c] -= 1
                     if "is-disabled" not in o_td.get('class', []):
@@ -223,15 +224,10 @@ with st.sidebar:
     
     available_races_dict = fetch_available_races(target_date)
     if available_races_dict:
-        stadiums = list(available_races_dict.keys())
-        if stadiums:
-            input_jcd = st.selectbox("🏟️ 開催場", stadiums)
-            target_rno = st.selectbox("🏁 レース番号(R)", available_races_dict[input_jcd])
-        else:
-            st.caption("※全レース終了")
-            input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
-            target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
+        input_jcd = st.selectbox("🏟️ 開催場", list(available_races_dict.keys()))
+        target_rno = st.selectbox("🏁 レース番号(R)", available_races_dict[input_jcd])
     else:
+        st.caption("※全レース終了 または 取得失敗")
         input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
         target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
     
@@ -276,7 +272,7 @@ if execute:
     result = analyze(race_data, bankroll)
 
     # === Phase 3: 予想ログ自動保存 ===
-    LOG_FILE = "predictions_log.csv"
+    LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "predictions_log.csv")
     if not result.get("error") and result.get("targets"):
         log_exists = os.path.isfile(LOG_FILE)
         with open(LOG_FILE, mode="a", encoding="utf-8-sig", newline="") as f:
