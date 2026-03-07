@@ -11,7 +11,7 @@ import concurrent.futures
 from rtpt_engine import analyze  # v6.3 Engine Integration
 
 # --- 初期設定 ---
-st.set_page_config(page_title="RTPT v6.3 — True Market Alpha Trader", layout="wide")
+st.set_page_config(page_title="RTPT v8.0 — Default Quant Engine", layout="wide")
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
@@ -214,8 +214,8 @@ def parse_all_odds(html_dict, race_data):
 # ============================================================
 # UI
 # ============================================================
-st.title("🎯 RTPT v6.3 — True Market Alpha Trader")
-st.caption("Alpha: Wall Decay (ΔST) のみ | 展示タイム・風アルファは二重取りとして削除済")
+st.title("🎯 RTPT v8.0 — AI Value Quant Engine")
+st.caption("Alpha: 推定勝率とオッズの歪み（期待値1.50以上）のみを狙撃するLightGBM特化型")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -268,7 +268,7 @@ if execute:
         parse_all_odds(html_data, race_data)
         status.update(label="✅ データ取得完了", state="complete")
 
-    # === Phase 2: v6.3 Engine Analysis ===
+    # === Phase 2: v8.0 AI Engine Analysis ===
     result = analyze(race_data, bankroll)
 
     # === Phase 3: 予想ログ自動保存 ===
@@ -302,10 +302,10 @@ if execute:
     if result.get("error"):
         st.warning(f"⏳ {result['error']}")
     else:
-        # --- 物理アルファ表示 ---
-        st.header(f"🧠 {input_jcd} {target_rno}R — 物理アルファ解析")
+        # --- AI推定勝率表示 ---
+        st.header(f"🧠 {input_jcd} {target_rno}R — AI解析（True Market Probability）")
         cols = st.columns(6)
-        for boat_info in result["boats"]:
+        for boat_info in result.get("boats", []):
             with cols[boat_info["boat"] - 1]:
                 delta = boat_info["post_prob"] - boat_info["tmp"]
                 st.metric(
@@ -315,47 +315,32 @@ if execute:
                     delta_color="normal" if delta >= 0 else "inverse"
                 )
                 st.caption(f"{boat_info['name']}")
-                st.caption(f"TMP:{boat_info['tmp']*100:.1f}% α:{boat_info['alpha']:.3f}")
-                if boat_info["wd"] < 12.0:
-                    st.error(f"⚠️ WD:{boat_info['wd']:.0f}")
+                st.caption(f"TMP:{boat_info['tmp']*100:.1f}% AI:{boat_info['post_prob']*100:.1f}%")
+                
                 for r in boat_info["reasons"]:
                     st.caption(f"📐 {r}")
 
         # --- 投資判断テーブル ---
-        st.header("💰 投資判断テーブル (Kelly Criterion)")
-        summary = result["summary"]
+        st.header("💰 投資判断テーブル (EV)")
+        targets = result.get("targets", [])
         
-        if summary["verdict"] == "見（ケン）":
-            st.error("🛑 **【判定: 見（ケン）】** EV 1.50以上の投資対象なし。本レースは完全見送り。")
+        if not targets:
+            st.error("🛑 **【判定: 見（ケン）】** トータルEVが基準を満たしません。本レースは完全見送り。")
         else:
-            # 集中投資モード表示
-            if summary.get("concentration_mode"):
-                top_ratio = summary.get("top_kelly_ratio", 0) * 100
-                top_combo = summary["max_ev_combo"]
-                st.warning(f"🎯 **【1点集中推奨】** Kelly比率 {top_ratio:.0f}% が閾値60%を超えました。"
-                           f"**{top_combo}** にバンクロール全額を集中投下することを推奨します。")
+            if result.get("is_concentrated"):
+                st.warning(f"🎯 **【集中投資発動】** ケリー基準の閾値を超えました。上位の買い目に強い自信があります。")
             
-            col1, col2, col3 = st.columns(3)
-            col1.metric("投資対象", f"{summary['count']}点")
-            col2.metric("平均EV", f"{summary['avg_ev']:.2f}")
-            col3.metric("最大EV", f"{summary['max_ev']:.2f}", f"{summary['max_ev_combo']}")
-            
-            # Table
             table_data = []
-            for t in result["targets"]:
-                if summary.get("concentration_mode") and not t.get("concentration"):
-                    continue  # 集中モード時は非推奨買い目を非表示
+            for t in targets:
                 row = {
                     "券種": t["type"],
                     "買い目": t["combo"],
                     "推定確率": f"{t['prob']*100:.1f}%",
                     "オッズ": f"{t['odds']:.1f}倍",
                     "EV": f"{t['ev']:.2f}",
-                    "Kelly%": f"{t['kelly_pct']:.1f}%",
+                    "Kelly%": f"{t['kelly_pct']*100:.1f}%",
                     "推奨額": f"{t['recommended_yen']}円"
                 }
-                if t.get("concentration"):
-                    row["推奨額"] = f"★ {t['recommended_yen']}円 (全額集中)"
                 table_data.append(row)
             st.dataframe(table_data, use_container_width=True, hide_index=True)
     

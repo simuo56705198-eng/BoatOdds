@@ -289,6 +289,18 @@ def analyze(race_data, bankroll=1000):
             if f in k and s in k: prob_wide += v
         add_bet("拡連複", f"{f}={s}", prob_wide, "連複")
 
+    # 複勝 (Show) 1~3着に入る確率
+    for b in range(1, 7):
+        prob_show = 0
+        for k, v in harville_probs.items():
+            if b in k: prob_show += v
+        add_bet("複勝", str(b), prob_show, "単勝/複勝")
+
+    # 単勝 (Win) 1着になる確率
+    for b in range(1, 7):
+        prob_win = prob_dict[b]  # すでに計算済みの1着確率をそのまま使う
+        add_bet("単勝", str(b), prob_win, "単勝/複勝")
+
     # Sort & Limit
     targets.sort(key=lambda x: x["ev"], reverse=True)
     targets = targets[:MAX_BETS_PER_RACE]
