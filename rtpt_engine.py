@@ -1,259 +1,303 @@
 """
-RTPT v6.3 — True Market Alpha + Kelly Criterion Engine (Module)
-Reusable analysis function for both CLI and Streamlit integration.
-Alpha source: Wall Decay (Slit Void Exploitation) ONLY.
-All public-information alphas (exhibition time, wind) removed as double-counting.
+RTPT v8.0 — AI Engine (Machine Learning)
+物理ロジックや統計ハックを全廃し、学習済みのLightGBMモデルを用いて真の勝率を予測する。
 """
 import math
 import itertools
 import re
+import os
+import json
+import joblib
+import pandas as pd
+import numpy as np
 
+# ====== ML Setup ======
+_MODEL = None
+_FEATURES = None
+
+def load_ml_model():
+    global _MODEL, _FEATURES
+    if _MODEL is not None:
+        return
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest")
+    model_path = os.path.join(base_dir, "v8_lgb_model.pkl")
+    features_path = os.path.join(base_dir, "v8_features.json")
+    
+    if not os.path.exists(model_path) or not os.path.exists(features_path):
+        raise FileNotFoundError(f"モデルファイルが見つかりません: {model_path}")
+        
+    _MODEL = joblib.load(model_path)
+    with open(features_path, "r", encoding="utf-8") as f:
+        _FEATURES = json.load(f)
+
+# ====== Constants ======
 EV_THRESHOLD = 1.50
-TRIFECTA_EV_THRESHOLD = 2.0     # 3連単/3連複の最低EV（より厳しい）
-TRIFECTA_MIN_PROB_EXACTA = 0.03  # 3連単：最低確率3%（低確率の長打ちを除外）
-TRIFECTA_MIN_PROB_COMBO = 0.08   # 3連複：最低確率8%（上位3着の確度が高い時のみ）
-CONCENTRATION_THRESHOLD = 0.60  # Kelly%がこれを超えたら1点集中推奨
+TRIFECTA_EV_THRESHOLD = 2.0
+TRIFECTA_MIN_PROB_EXACTA = 0.03
+TRIFECTA_MIN_PROB_COMBO = 0.08
+CONCENTRATION_THRESHOLD = 0.60
+MAX_BETS_PER_RACE = 3
+
+def extract_float(text):
+    if pd.isna(text) or text == "" or text is None: return 0.0
+    m = re.search(r'-?[\d\.]+', str(text))
+    return float(m.group()) if m else 0.0
+
+def parse_st(st_str):
+    st_str = str(st_str).strip()
+    try:
+        if "F" in st_str.upper():
+            raw = re.sub(r'[Ff]', '', st_str).strip()
+            if not raw or raw == '.': return 0.0
+            return -float('0' + raw) if raw.startswith('.') else -float(raw)
+        elif "L" in st_str.upper():
+            return 0.25
+        elif st_str.startswith("."):
+            return float("0" + st_str)
+        else:
+            return float(st_str)
+    except ValueError:
+        return 0.10
+
+def build_ml_features(race_data):
+    """1レース分のJSONデータから、モデル入力用のDataFrame(6行)を作成する"""
+    predata = race_data if "racelist" in race_data else race_data.get("predata", {})
+    env = predata.get("environment", {})
+    racelist = predata.get("racelist", {})
+    odds_data = predata.get("odds", {})
+    
+    # 1. Environment
+    wind_speed = env.get("wind_speed", 0.0)
+    wave_height = env.get("wave_height", 0.0)
+    wind_dir_raw = env.get("wind_direction", "無風")
+    if "追い" in wind_dir_raw: wind_dir = 1
+    elif "向かい" in wind_dir_raw: wind_dir = -1
+    else: wind_dir = 0
+    
+    # 2. TMP
+    base_probs = {}
+    for b_no in range(1, 7):
+        win_odd = odds_data.get("単勝", {}).get(str(b_no))
+        if win_odd and extract_float(win_odd) > 0:
+            base_probs[b_no] = 1.0 / extract_float(win_odd)
+        else:
+            base_probs[b_no] = 1.0 / 6.0
+    total_prob = sum(base_probs.values())
+    tmp_win = {k: v / total_prob for k, v in base_probs.items()}
+    
+    # 3. Boat Base Features
+    records = []
+    exh_times = []
+    win_rates = []
+    motor_2rens = []
+    sts = []
+    
+    for b_no in range(1, 7):
+        b = racelist.get(str(b_no), {})
+        exh = b.get("exhibition_time", 0.0)
+        wr = b.get("win_rate_national", 0.0)
+        mot = b.get("motor_2ren", 0.0)
+        st = parse_st(b.get("start_exhibition_st", "0.15"))
+        
+        if exh > 0: exh_times.append(exh)
+        if wr > 0: win_rates.append(wr)
+        if mot > 0: motor_2rens.append(mot)
+        sts.append(st)
+        
+        rank_str = b.get("class", "B1")
+        if "A1" in rank_str: class_val = 4
+        elif "A2" in rank_str: class_val = 3
+        elif "B1" in rank_str: class_val = 2
+        elif "B2" in rank_str: class_val = 1
+        else: class_val = 2
+        
+        records.append({
+            "boat": b_no,
+            "course": b.get("start_course", b_no),
+            "class": class_val,
+            "win_rate": wr,
+            "motor": mot,
+            "exh_time": exh,
+            "exh_st": st,
+            "tilt": b.get("tilt", 0.0)
+        })
+        
+    mean_exh = np.mean(exh_times) if exh_times else 0
+    std_exh = np.std(exh_times) if len(exh_times)>1 else 1
+    mean_wr = np.mean(win_rates) if win_rates else 0
+    mean_mot = np.mean(motor_2rens) if motor_2rens else 0
+    mean_st = np.mean(sts) if sts else 0
+    
+    features = []
+    for r in records:
+        b_no = r["boat"]
+        feat = {
+            "boat": r["boat"],
+            "wind_speed": wind_speed,
+            "wave_height": wave_height,
+            "wind_dir": wind_dir,
+            "tmp_win_prob": tmp_win.get(b_no, 0.166),
+            "course": r["course"],
+            "class": r["class"],
+            "win_rate": r["win_rate"],
+            "motor": r["motor"],
+            "exh_time": r["exh_time"],
+            "exh_st": r["exh_st"],
+            "tilt": r["tilt"],
+            "exh_time_z": (r["exh_time"] - mean_exh) / (std_exh + 0.001) if r["exh_time"] > 0 else 0,
+            "win_rate_diff": r["win_rate"] - mean_wr,
+            "motor_diff": r["motor"] - mean_mot,
+            "st_diff": r["exh_st"] - mean_st,
+        }
+        features.append(feat)
+        
+    df = pd.DataFrame(features)
+    df["tmp_rank"] = df["tmp_win_prob"].rank(ascending=False, method="min")
+    df["exh_time_rank"] = df["exh_time"].replace(0, np.nan).rank(ascending=True, method="min").fillna(6)
+    df["win_rate_rank"] = df["win_rate"].rank(ascending=False, method="min")
+    df["motor_rank"] = df["motor"].rank(ascending=False, method="min")
+    df["st_rank"] = df["exh_st"].rank(ascending=True, method="min")
+    df = df.fillna(0)
+    
+    return df, tmp_win
 
 def analyze(race_data, bankroll=1000):
-    """
-    Analyze race data and return structured investment recommendations.
-    Returns a dict with:
-      - "boats": list of per-boat analysis dicts
-      - "targets": list of investment target dicts (sorted by EV desc)
-      - "summary": summary stats dict (includes concentration_mode flag)
-      - "error": error string if any
-    """
-    racelist = race_data.get("racelist", {})
-    env = race_data.get("environment", {})
-    odds_data = race_data.get("odds", {})
-
-    # --- Validation ---
-    # NOTE: exhibition_time must be > 0, not just truthy (0.0 is falsy in Python)
-    for k, b in racelist.items():
-        if b.get("exhibition_time", 0) <= 0 or not b.get("start_exhibition_st"):
-            return {"error": "展示データ欠損のため解析不可", "boats": [], "targets": [], "summary": {}}
-
-    # Parse Exhibition Start Timing
-    # ".08" → "0.08", "F.01" → -0.01, "L" → 0.25
-    # JSONにparsed_stが既に存在する場合は数値として読み直す（型を保証）
-    for k, b in racelist.items():
-        if "parsed_st" in b:
-            b["parsed_st"] = float(b["parsed_st"])
-            continue
-        st_str = str(b.get("start_exhibition_st", "0.10")).strip()
-        try:
-            if "F" in st_str.upper():
-                raw = re.sub(r'[Ff]', '', st_str).strip()
-                if not raw or raw == '.':
-                    b["parsed_st"] = 0.0
-                elif raw.startswith('.'):
-                    b["parsed_st"] = -float('0' + raw)
-                else:
-                    b["parsed_st"] = -float(raw)
-            elif "L" in st_str.upper():
-                b["parsed_st"] = 0.25
-            elif st_str.startswith("."):
-                b["parsed_st"] = float("0" + st_str)
-            else:
-                b["parsed_st"] = float(st_str)
-        except ValueError:
-            b["parsed_st"] = 0.10  # フォールバック
-
-    # === Step 1: True Market Probability (TMP) ===
-    raw_tmp = {}
-    win_odds = odds_data.get("単勝", {})
-    if not win_odds:
-        return {"error": "単勝オッズが存在しないため解析不可", "boats": [], "targets": [], "summary": {}}
+    try:
+        load_ml_model()
+    except Exception as e:
+        return {"error": f"ML準備エラー: {str(e)}"}
+        
+    predata = race_data if "racelist" in race_data else race_data.get("predata", {})
+    if not predata.get("racelist"):
+        return {"error": "事前情報がありません"}
+        
+    # --- ML Inference ---
+    df_feat, tmp_dict = build_ml_features(race_data)
     
-    for k_str, odds_val in win_odds.items():
-        val = float(odds_val) if odds_val else 100.0
-        raw_tmp[int(k_str)] = 1.0 / max(val, 1.0)
+    # 欠損した列の補填（学習時と合わせる）
+    for c in _FEATURES:
+        if c not in df_feat.columns:
+            df_feat[c] = 0
+            
+    # 学習時と同じ順序に並び替え
+    X = df_feat[_FEATURES].copy()
+    
+    # Categorical variables
+    cat_features = ["boat", "course", "class"]
+    for c in cat_features:
+        if c in X.columns:
+            X[c] = X[c].astype("category")
 
-    total_raw_tmp = sum(raw_tmp.values())
-    tmp_dict = {k: v / total_raw_tmp for k, v in raw_tmp.items()}
-
-    # === Step 2: Physics Alpha ===
-    alpha_dict = {i: 1.0 for i in range(1, 7)}
-    alpha_reasons = {i: [] for i in range(1, 7)}
-
-    # 2-A: Exhibition Time Alpha — 削除 (v6.2)
-    # 理由: 展示タイムは市場参加者全員が見ている公開情報である。
-    # TMP（単勝オッズ）にはすでに展示タイムの評価が完全に織り込まれているため、
-    # ここで再度アルファとして加算すると「二重取り」となり、
-    # 我々の唯一の真のエッジ（Wall Decay）を汚染する。
-    # 真のクオンツは「市場が見ていない情報だけ」をアルファにする。
-
-    # 2-B: Wind Direction Alpha — 削除 (v6.3)
-    # 理由: 風向き・風速はboatrace.jpに公開されており全市場参加者が見ている。
-    # TMP（単勝オッズ）にすでに完全に織り込まれているため二重取りになる。
-
-    # 2-C: Wall Decay / Slit Void Exploitation（唯一の真のエッジ）
-    wd_dict = {i: 12.0 for i in range(1, 7)}
-    for i in range(1, 6):
-        inner_st = racelist[str(i)].get("parsed_st", 0.1)
-        outer_st = racelist[str(i+1)].get("parsed_st", 0.1)
-        delta_st = inner_st - outer_st
-
-        if delta_st >= 0.08:
-            wd_dict[i] = 0.0
-            alpha_dict[i+1] *= 1.5
-            alpha_dict[i] *= 0.5
-            alpha_reasons[i+1].append(f"VoidExploit(ΔST={delta_st:.2f}→α×1.5)")
-            alpha_reasons[i].append(f"WallDecay(ΔST={delta_st:.2f}→α×0.5)")
-        elif delta_st >= 0.04:
-            wd_dict[i] *= 0.5
-            alpha_dict[i+1] *= 1.2
-            alpha_dict[i] *= 0.8
-            alpha_reasons[i+1].append(f"VoidExploit(ΔST={delta_st:.2f}→α×1.2)")
-            alpha_reasons[i].append(f"WallHalf(ΔST={delta_st:.2f}→α×0.8)")
-
-    # === Step 3: Posterior Probability ===
-    posterior_raw = {k: tmp_dict.get(k, 1/6) * max(0.1, alpha_dict[k]) for k in range(1, 7)}
-    total_posterior = sum(posterior_raw.values())
-    prob_dict = {k: v / total_posterior for k, v in posterior_raw.items()}
-
+    # Predict
+    # classes are usually sorted [0, 1, 2, 3] by LightGBM
+    preds = _MODEL.predict(X)
+    
+    # 1st-place probability is index 1 (because target was 1 for 1st)
+    post_probs = {}
+    for i in range(6):
+        b_no = i + 1
+        post_probs[b_no] = float(preds[i, 1])  # probability of being 1st
+        
+    # Normalize
+    total_post = sum(post_probs.values())
+    if total_post == 0: total_post = 1
+    prob_dict = {k: v / total_post for k, v in post_probs.items()}
+    
+    # For UI display
     boats = []
+    racelist = predata.get("racelist", {})
     for k in range(1, 7):
+        b = racelist.get(str(k), {})
         boats.append({
             "boat": k,
-            "name": racelist[str(k)].get("name", "").strip(),
+            "name": b.get("name", "").strip(),
             "tmp": tmp_dict.get(k, 0),
-            "alpha": alpha_dict[k],
+            "alpha": prob_dict[k] / tmp_dict.get(k, 0.001) if tmp_dict.get(k, 0) > 0 else 1.0, # Visual ratio
             "post_prob": prob_dict[k],
-            "wd": wd_dict[k],
-            "reasons": alpha_reasons[k]
+            "reasons": [f"AI 1着確率: {post_probs[k]*100:.1f}%"]
         })
 
-    # === Step 4: Harville (120 permutations) ===
+    # === Harville (120 permutations) ===
     harville_probs = {}
     for perm in itertools.permutations([1, 2, 3, 4, 5, 6], 3):
         first, second, third = perm
         p1 = prob_dict[first]
-        p2 = prob_dict[second] / (1.0 - p1)
-        p3 = prob_dict[third] / (1.0 - p1 - prob_dict[second])
+        if p1 <= 0: continue
+        p2 = prob_dict[second] / (1 - prob_dict[first] + 1e-9)
+        if p2 <= 0: continue
+        p3 = prob_dict[third] / (1 - prob_dict[first] - prob_dict[second] + 1e-9)
         harville_probs[perm] = p1 * p2 * p3
 
-    # === Step 5: Extract ALL qualifying bets ===
-    investment_targets = []
-
-    if "2連単" in odds_data:
-        for k, odds in odds_data["2連単"].items():
-            first, second = map(int, k.split('-'))
-            est_prob = sum(harville_probs[(first, second, t)] for t in range(1, 7) if t not in (first, second))
-            ev = est_prob * float(odds)
-            if ev >= EV_THRESHOLD:
-                investment_targets.append({"type": "2連単", "combo": k, "prob": est_prob, "odds": float(odds), "ev": ev})
-
-    if "2連複" in odds_data:
-        for k, odds in odds_data["2連複"].items():
-            first, second = map(int, k.split('='))
-            est_prob = sum(harville_probs[p] for p in harville_probs if (p[0] == first and p[1] == second) or (p[0] == second and p[1] == first))
-            ev = est_prob * float(odds)
-            if ev >= EV_THRESHOLD:
-                investment_targets.append({"type": "2連複", "combo": k, "prob": est_prob, "odds": float(odds), "ev": ev})
-
-    if "拡連複" in odds_data:
-        for k, odds_str in odds_data["拡連複"].items():
-            first, second = map(int, k.split('='))
-            est_prob = sum(harville_probs[p] for p in harville_probs if first in p and second in p)
-            try:
-                min_odds = float(str(odds_str).split('-')[0])
-                ev = est_prob * min_odds
-                if ev >= EV_THRESHOLD:
-                    investment_targets.append({"type": "拡連複", "combo": k, "prob": est_prob, "odds": min_odds, "ev": ev})
-            except:
-                pass
-
-    # 3連単: EV >= 2.0 かつ 推定確率 >= 3% の時のみ（自信がある買い目に限定）
-    if "3連単" in odds_data:
-        for k, odds in odds_data["3連単"].items():
-            try:
-                first, second, third = map(int, k.split('-'))
-                est_prob = harville_probs.get((first, second, third), 0.0)
-                ev = est_prob * float(odds)
-                if ev >= TRIFECTA_EV_THRESHOLD and est_prob >= TRIFECTA_MIN_PROB_EXACTA:
-                    investment_targets.append({"type": "3連単", "combo": k, "prob": est_prob, "odds": float(odds), "ev": ev})
-            except (ValueError, KeyError):
-                pass
-
-    # 3連複: EV >= 1.8 かつ 推定確率 >= 8% の時のみ（上位3艇の確度が高い時のみ）
-    if "3連複" in odds_data:
-        for k, odds in odds_data["3連複"].items():
-            try:
-                boats_combo = list(map(int, k.split('=')))
-                est_prob = sum(harville_probs[p] for p in itertools.permutations(boats_combo, 3))
-                ev = est_prob * float(odds)
-                if ev >= TRIFECTA_EV_THRESHOLD and est_prob >= TRIFECTA_MIN_PROB_COMBO:
-                    investment_targets.append({"type": "3連複", "combo": k, "prob": est_prob, "odds": float(odds), "ev": ev})
-            except (ValueError, KeyError):
-                pass
-
-    investment_targets.sort(key=lambda x: x["ev"], reverse=True)
-
-    # === Step 6: Kelly Criterion ===
-    kelly_fractions = []
-    for t in investment_targets:
-        b = t["odds"] - 1.0
-        if b > 0:
-            kelly_f = max(0.0, (t["prob"] * b - (1.0 - t["prob"])) / b)
-        else:
-            kelly_f = 0.0
-        kelly_fractions.append(kelly_f)
-
-    total_kelly = sum(kelly_fractions)
+    # === Expected Value (EV) & Kelly ===
+    odds_data = predata.get("odds", {})
+    targets = []
     
-    # Kelly配分を算出し、合計がバンクロールを超えないよう正規化する
-    raw_yen = []
-    for i, t in enumerate(investment_targets):
-        pct = (kelly_fractions[i] / total_kelly * 100) if total_kelly > 0 else 0
-        t["kelly_pct"] = pct
-        raw_yen.append(bankroll * pct / 100)
+    def add_bet(b_type, combo_str, success_prob, ticket_type="連単"):
+        if success_prob <= 0: return
+        odds_dict = odds_data.get(b_type, {})
+        odds_val = extract_float(odds_dict.get(combo_str, 0))
+        if odds_val <= 0: return
+        
+        ev = success_prob * odds_val
+        kelly = max(0, (ev - 1) / (odds_val - 1)) if odds_val > 1 else 0
+        
+        thres = TRIFECTA_EV_THRESHOLD if "3連" in b_type else EV_THRESHOLD
+        if "3連単" in b_type and success_prob < TRIFECTA_MIN_PROB_EXACTA: return
+        if "3連複" in b_type and success_prob < TRIFECTA_MIN_PROB_COMBO: return
+            
+        if ev >= thres and kelly > 0.001:
+            rec_yen = math.floor((bankroll * kelly) / 100) * 100
+            if rec_yen > 0:
+                targets.append({
+                    "type": b_type,
+                    "combo": combo_str,
+                    "prob": success_prob,
+                    "odds": odds_val,
+                    "ev": ev,
+                    "kelly_pct": kelly,
+                    "recommended_yen": rec_yen
+                })
+
+    # Enum combinations
+    for f in range(1, 7):
+        for s in range(1, 7):
+            if f == s: continue
+            # 2連単
+            prob_exacta = sum(v for k, v in harville_probs.items() if k[0] == f and k[1] == s)
+            add_bet("2連単", f"{f}-{s}", prob_exacta)
+            # 3連単
+            for t in range(1, 7):
+                if t in (f, s): continue
+                prob_trifecta = harville_probs[(f, s, t)]
+                add_bet("3連単", f"{f}-{s}-{t}", prob_trifecta)
     
-    # === Step 7: Concentration Mode Detection ===
-    # 最上位買い目のKelly割合が全体の60%を超える場合は「1点集中推奨」とする
-    # 数学的根拠: 複数の相関した買い目に分散するより、最大EVの1点に全額投下する方が
-    # 期待ログ成長率が高くなる局面がある。
-    concentration_mode = False
-    if kelly_fractions and total_kelly > 0:
-        top_kelly_ratio = kelly_fractions[0] / total_kelly
-        if top_kelly_ratio >= CONCENTRATION_THRESHOLD:
-            concentration_mode = True
-            # 集中モード: 1位の買い目にバンクロール全額を推奨
-            for i, t in enumerate(investment_targets):
-                if i == 0:
-                    t["recommended_yen"] = bankroll
-                    t["concentration"] = True
-                else:
-                    t["recommended_yen"] = 0  # 購入しない
-                    t["concentration"] = False
-        else:
-            # 分散モード: 100円単位に丸め、合計がバンクロールを超えないよう調整
-            concentration_mode = False
-            total_raw = sum(raw_yen)
-            for i, t in enumerate(investment_targets):
-                if total_raw > 0:
-                    normalized = raw_yen[i] / total_raw * bankroll
-                else:
-                    normalized = 0
-                t["recommended_yen"] = max(100, round(normalized / 100) * 100)
-                t["concentration"] = False
-    else:
-        for i, t in enumerate(investment_targets):
-            t["recommended_yen"] = 100
-            t["concentration"] = False
+    # 2連複
+    for f, s in itertools.combinations([1, 2, 3, 4, 5, 6], 2):
+        prob_quinella = sum(v for k, v in harville_probs.items() if set(k[:2]) == {f, s})
+        add_bet("2連複", f"{f}={s}", prob_quinella, "連複")
+    
+    # 3連複
+    for comb in itertools.combinations([1, 2, 3, 4, 5, 6], 3):
+        prob_trio = sum(v for k, v in harville_probs.items() if set(k) == set(comb))
+        comb_str = "=".join(map(str, sorted(comb)))
+        add_bet("3連複", comb_str, prob_trio, "連複")
+        
+    # 拡連複 (Wide)
+    for f, s in itertools.combinations([1, 2, 3, 4, 5, 6], 2):
+        prob_wide = 0
+        for k, v in harville_probs.items():
+            if f in k and s in k: prob_wide += v
+        add_bet("拡連複", f"{f}={s}", prob_wide, "連複")
 
-    summary = {}
-    if investment_targets:
-        summary = {
-            "count": len(investment_targets),
-            "avg_ev": sum(t["ev"] for t in investment_targets) / len(investment_targets),
-            "max_ev": investment_targets[0]["ev"],
-            "max_ev_combo": investment_targets[0]["combo"],
-            "verdict": "投資実行",
-            "concentration_mode": concentration_mode,
-            "top_kelly_ratio": (kelly_fractions[0] / total_kelly) if (kelly_fractions and total_kelly > 0) else 0
-        }
-    else:
-        summary = {"count": 0, "avg_ev": 0, "max_ev": 0, "max_ev_combo": "", "verdict": "見（ケン）", "concentration_mode": False, "top_kelly_ratio": 0}
+    # Sort & Limit
+    targets.sort(key=lambda x: x["ev"], reverse=True)
+    targets = targets[:MAX_BETS_PER_RACE]
 
-    return {"error": None, "boats": boats, "targets": investment_targets, "summary": summary}
+    return {
+        "boats": boats,
+        "targets": targets,
+        "is_concentrated": any(t["kelly_pct"] >= CONCENTRATION_THRESHOLD for t in targets)
+    }
+
+if __name__ == "__main__":
+    pass
