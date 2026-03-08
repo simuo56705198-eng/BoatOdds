@@ -7,9 +7,12 @@ import itertools
 import re
 import os
 import json
+import json
 import joblib
 import pandas as pd
 import numpy as np
+import csv
+import datetime
 
 # ====== ML Setup ======
 _MODEL = None
@@ -166,6 +169,104 @@ def build_ml_features(race_data):
     
     return df, tmp_win
 
+
+def apply_physics_knowledge(predata, prob_dict):
+    """
+    MLモデルが出力した純粋な確率に対し、指定された物理法則ドメイン知識（knowledge配下のCSV）
+    を用いて決定論的な事後補正（Post-Processing）を行う。
+    """
+    env = predata.get("environment", {})
+    stadium = predata.get("metadata", {}).get("stadium", "")
+    date_str = predata.get("metadata", {}).get("date", "")
+    
+    # 1. モーター交換月による不確実性補正
+    # 交換月から2ヶ月以内の場合、MLの算出確率（特に機力依存部分）の信頼性が落ちるため、全体を平均方向へ少し平滑化する
+    try:
+        motor_csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge", "motor_replacement_list.csv")
+        if os.path.exists(motor_csv_path) and date_str:
+            current_month = int(str(date_str)[4:6])
+            is_uncertain = False
+            with open(motor_csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row["場名"] == stadium:
+                        replace_month = int(row["モーター交換月"])
+                        # 交換月、あるいはその翌月の場合は不確実
+                        next_month = replace_month + 1 if replace_month < 12 else 1
+                        if current_month == replace_month or current_month == next_month:
+                            is_uncertain = True
+                        break
+            
+            if is_uncertain:
+                # 確率を平滑化（Softmax temperature-like effect）
+                # (prob + (1/6) * 0.5) / 1.5
+                for k in prob_dict:
+                    prob_dict[k] = (prob_dict[k] + (1.0 / 6.0) * 0.3) / 1.3
+                
+                # 正規化
+                total = sum(prob_dict.values())
+                for k in prob_dict:
+                    prob_dict[k] /= total
+                print(f"  [Physics] モーター交換直後({stadium}): AI確率を保守的に平滑化しました。")
+    except Exception as e:
+        print(f"  [Physics Error] Motor Check: {e}")
+
+    # 2. 場ごとの物理パラメーター補正
+    try:
+        physics_csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge", "comprehensive_venue_physics.csv")
+        if os.path.exists(physics_csv_path):
+            wind_speed = env.get("wind_speed", 0.0)
+            wave_height = env.get("wave_height", 0.0)
+            wind_dir = env.get("wind_direction", "")
+            
+            with open(physics_csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    venue_name = row["VenueName"]
+                    if venue_name != stadium:
+                        continue
+                        
+                    # 固有の物理ルール適用
+                    if stadium == "江戸川" and wave_height >= 5.0:
+                        # 波高5cm以上で1コースを激減
+                        prob_dict[1] *= 0.5
+                        print(f"  [Physics] {stadium} 波高{wave_height}cm: 1コースの逃げ確率を半減（キャビテーション）。")
+                    
+                    elif stadium == "平和島" and wind_speed >= 4.0 and "追い" in wind_dir:
+                        # 追い風4m以上で6コースを倍増
+                        prob_dict[6] *= 2.0
+                        print(f"  [Physics] {stadium} 追い風{wind_speed}m: 6コースからの浮上ベクトルを2倍に補正。")
+                        
+                    elif stadium == "津" and wind_speed >= 5.0:
+                        # 強風によるバウリフト
+                        prob_dict[1] *= 0.7
+                        prob_dict[2] *= 1.3
+                        prob_dict[3] *= 1.3
+                        print(f"  [Physics] {stadium} 鈴鹿おろし{wind_speed}m: 1コース減衰、2・3コース差し確率上昇。")
+                        
+                    elif stadium == "福岡" and (wave_height >= 3.0 or ("向かい" in wind_dir and wind_speed >= 4.0)):
+                         # 1Mうねりと向かい風による3コース全速旋回ライン消滅
+                         prob_dict[3] *= 0.6
+                         prob_dict[2] *= 1.4
+                         print(f"  [Physics] {stadium} 1Mうねり発生: 3コースの握り込み減衰、2コース差し確率上昇。")
+                         
+                    elif stadium == "若松" and "18:" in str(datetime.datetime.now().time()): # 簡易ナイター判定
+                         # ナイター空気密度
+                         prob_dict[1] *= 1.15
+                         print(f"  [Physics] {stadium} ナイター: 空気密度上昇による1コース初動トルク15%増幅。")
+                         
+                    # Normalized again after physical adjustment
+                    total = sum(prob_dict.values())
+                    for k in prob_dict:
+                        prob_dict[k] /= total
+                    
+                    break # Venue found and processed
+    except Exception as e:
+        print(f"  [Physics Error] Venue Physics: {e}")
+
+    return prob_dict
+
+
 def analyze(race_data, bankroll=1000):
     try:
         load_ml_model()
@@ -207,6 +308,9 @@ def analyze(race_data, bankroll=1000):
     total_post = sum(post_probs.values())
     if total_post == 0: total_post = 1
     prob_dict = {k: v / total_post for k, v in post_probs.items()}
+    
+    # --- Inject Domain Physics Knowledge ---
+    prob_dict = apply_physics_knowledge(predata, prob_dict)
     
     # For UI display
     boats = []
