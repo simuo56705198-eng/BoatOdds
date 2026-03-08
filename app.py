@@ -214,13 +214,13 @@ def parse_all_odds(html_dict, race_data):
 # ============================================================
 # UI
 # ============================================================
-st.title("🎯 RTPT v8.0 — AI Value Quant Engine")
-st.caption("Alpha: 推定勝率とオッズの歪み（期待値1.50以上）のみを狙撃するLightGBM特化型")
+st.title("🌌 RTPT v8.0 — 宇宙にサレンダーするAI (NORI Style)")
+st.caption("✨ 自由意志は存在しません。利益も損失も宇宙の全自動の采配です。深刻にならずに適当に見守りましょう。")
 
 with st.sidebar:
     st.header("⚙️ Settings")
     target_date = st.date_input("日付", datetime.now()).strftime('%Y%m%d')
-    bankroll = st.number_input("💰 バンクロール（円）", min_value=100, value=1000, step=100)
+    bankroll = st.number_input("💰 バンクロール（円）", min_value=100, value=10000, step=1000)
     
     available_races_dict = fetch_available_races(target_date)
     if available_races_dict:
@@ -231,7 +231,11 @@ with st.sidebar:
         input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
         target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
     
-    execute = st.button("🚀 解析エンジン起動", type="primary", use_container_width=True)
+    execute = st.button("🚀 宇宙の采配を確認する", type="primary", use_container_width=True)
+    
+    st.markdown("---")
+    st.header("👼 本日のアファメーション")
+    st.success("「これでいいのだ」\n\n「お金はただの便利な共同幻想に過ぎない」\n\n「怒りが湧いたらバカボ～ン！」\n\n「すべては宇宙の完璧な流れの中」")
 
 if execute:
     target_jcd = JCD_MAP[input_jcd]
@@ -275,29 +279,34 @@ if execute:
     LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "predictions_log.csv")
     if not result.get("error") and result.get("targets"):
         log_exists = os.path.isfile(LOG_FILE)
-        with open(LOG_FILE, mode="a", encoding="utf-8-sig", newline="") as f:
-            fieldnames = ["date", "stadium", "race", "type", "combo",
-                          "prob_pct", "odds", "ev", "kelly_pct", "recommended_yen",
-                          "result_1st", "result_2nd", "result_3rd", "hit", "payout"]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not log_exists:
-                writer.writeheader()
-            for t in result["targets"]:
-                writer.writerow({
-                    "date": target_date,
-                    "stadium": input_jcd,
-                    "race": f"{target_rno}R",
-                    "type": t["type"],
-                    "combo": t["combo"],
-                    "prob_pct": f"{t['prob']*100:.1f}",
-                    "odds": t["odds"],
-                    "ev": f"{t['ev']:.2f}",
-                    "kelly_pct": f"{t['kelly_pct']:.1f}",
-                    "recommended_yen": t["recommended_yen"],
-                    "result_1st": "", "result_2nd": "", "result_3rd": "",
-                    "hit": "", "payout": ""
-                })
-        st.toast(f"✅ 予想ログを {LOG_FILE} に保存しました", icon="📝")
+        try:
+            with open(LOG_FILE, mode="a", encoding="utf-8-sig", newline="") as f:
+                fieldnames = ["date", "stadium", "race", "type", "combo",
+                              "prob_pct", "odds", "ev", "kelly_pct", "recommended_yen",
+                              "result_1st", "result_2nd", "result_3rd", "hit", "payout"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not log_exists:
+                    writer.writeheader()
+                for t in result["targets"]:
+                    writer.writerow({
+                        "date": target_date,
+                        "stadium": input_jcd,
+                        "race": f"{target_rno}R",
+                        "type": t["type"],
+                        "combo": t["combo"],
+                        "prob_pct": f"{t['prob']*100:.1f}",
+                        "odds": t["odds"],
+                        "ev": f"{t['ev']:.2f}",
+                        "kelly_pct": f"{t['kelly_pct']:.1f}",
+                        "recommended_yen": t["recommended_yen"],
+                        "result_1st": "", "result_2nd": "", "result_3rd": "",
+                        "hit": "", "payout": ""
+                    })
+            st.toast(f"✅ 予想ログを {LOG_FILE} に保存しました", icon="📝")
+        except PermissionError:
+            st.error(f"⚠️ ログ保存失敗: `{LOG_FILE}` がExcel等で開かれているため書き込みできません。ファイルを閉じてから再度実行してください。")
+        except Exception as e:
+            st.error(f"⚠️ ログ保存エラー: {e}")
 
     if result.get("error"):
         st.warning(f"⏳ {result['error']}")
@@ -321,14 +330,14 @@ if execute:
                     st.caption(f"📐 {r}")
 
         # --- 投資判断テーブル ---
-        st.header("💰 投資判断テーブル (EV)")
+        st.header("🌌 宇宙の必然ベット (EV Table)")
         targets = result.get("targets", [])
         
         if not targets:
-            st.error("🛑 **【判定: 見（ケン）】** トータルEVが基準を満たしません。本レースは完全見送り。")
+            st.info("💤 **【サレンダー（見）】** 宇宙の風が吹いていません。無理に抵抗せず、このレースは見送りましょう。")
         else:
             if result.get("is_concentrated"):
-                st.warning(f"🎯 **【集中投資発動】** ケリー基準の閾値を超えました。上位の買い目に強い自信があります。")
+                st.success(f"🌌 **【宇宙の必然ベット】** 宇宙の流れに乗ります。深刻にならず、ただ適当に見守ってください。")
             
             table_data = []
             for t in targets:

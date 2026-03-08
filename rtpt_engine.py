@@ -1,6 +1,6 @@
 """
 RTPT v8.0 — AI Engine (Machine Learning)
-物理ロジックや統計ハックを全廃し、学習済みのLightGBMモデルを用いて真の勝率を予測する。
+自由意志を手放し、LightGBMが見出した宇宙のオッズの歪み（必然の流れ）にサレンダーするエンジン。
 """
 import math
 import itertools
@@ -33,8 +33,8 @@ def load_ml_model():
 # ====== Constants ======
 EV_THRESHOLD = 1.50
 TRIFECTA_EV_THRESHOLD = 2.0
-TRIFECTA_MIN_PROB_EXACTA = 0.03
-TRIFECTA_MIN_PROB_COMBO = 0.08
+TRIFECTA_MIN_PROB_EXACTA = 0.005  # Lowered from 0.03 to allow 200x+ longshots (大荒れ)
+TRIFECTA_MIN_PROB_COMBO = 0.015   # Lowered from 0.08 to capture 3連複 upsets
 CONCENTRATION_THRESHOLD = 0.60
 MAX_BETS_PER_RACE = 3
 
@@ -122,6 +122,7 @@ def build_ml_features(race_data):
             "tilt": b.get("tilt", 0.0)
         })
         
+    # Calculate race means/stds across all 6 boats for normalization
     mean_exh = np.mean(exh_times) if exh_times else 0
     std_exh = np.std(exh_times) if len(exh_times)>1 else 1
     mean_wr = np.mean(win_rates) if win_rates else 0
@@ -152,11 +153,15 @@ def build_ml_features(race_data):
         features.append(feat)
         
     df = pd.DataFrame(features)
+    
+    # Needs to match create_ml_dataset logic exactly!
+    # Because there's only 1 race here, we don't need groupby
     df["tmp_rank"] = df["tmp_win_prob"].rank(ascending=False, method="min")
     df["exh_time_rank"] = df["exh_time"].replace(0, np.nan).rank(ascending=True, method="min").fillna(6)
     df["win_rate_rank"] = df["win_rate"].rank(ascending=False, method="min")
     df["motor_rank"] = df["motor"].rank(ascending=False, method="min")
     df["st_rank"] = df["exh_st"].rank(ascending=True, method="min")
+    
     df = df.fillna(0)
     
     return df, tmp_win
@@ -169,7 +174,7 @@ def analyze(race_data, bankroll=1000):
         
     predata = race_data if "racelist" in race_data else race_data.get("predata", {})
     if not predata.get("racelist"):
-        return {"error": "事前情報がありません"}
+        return {"error": "宇宙からの事前情報がまだ届いていません (No Data)"}
         
     # --- ML Inference ---
     df_feat, tmp_dict = build_ml_features(race_data)
@@ -238,15 +243,28 @@ def analyze(race_data, bankroll=1000):
         odds_val = extract_float(odds_dict.get(combo_str, 0))
         if odds_val <= 0: return
         
-        ev = success_prob * odds_val
-        kelly = max(0, (ev - 1) / (odds_val - 1)) if odds_val > 1 else 0
+        # 売上が小さく直前にオッズが暴落しやすい券種へのスリッページ補正（ペナルティ）
+        slippage_multiplier = 1.0
+        if "複勝" in b_type or "単勝" in b_type:
+            slippage_multiplier = 0.5  # 半額に落ちると想定して厳しめに計算する
+            
+        adjusted_odds = max(1.0, odds_val * slippage_multiplier)
+        
+        ev = success_prob * adjusted_odds
+        
+        # --- Fractional Kelly / Risk Control ---
+        # 「フルケリー」は資金の増減が乱高下し、全損（破産）の確率が極めて高くなるため
+        # 極端に保守的な「1/8ケリー」を採用。これにより、一度に賭ける額を小さく抑え
+        # ユーザーの資金（4万円）をドローダウンから絶対に死守する。
+        KELLY_FRACTION = 0.125
+        kelly = max(0, (ev - 1) / (adjusted_odds - 1)) * KELLY_FRACTION if adjusted_odds > 1 else 0
         
         thres = TRIFECTA_EV_THRESHOLD if "3連" in b_type else EV_THRESHOLD
         if "3連単" in b_type and success_prob < TRIFECTA_MIN_PROB_EXACTA: return
         if "3連複" in b_type and success_prob < TRIFECTA_MIN_PROB_COMBO: return
             
-        if ev >= thres and kelly > 0.001:
-            rec_yen = math.floor((bankroll * kelly) / 100) * 100
+        if ev >= thres and kelly > 0.0001:
+            rec_yen = max(100, math.floor((bankroll * kelly) / 100) * 100)
             if rec_yen > 0:
                 targets.append({
                     "type": b_type,
