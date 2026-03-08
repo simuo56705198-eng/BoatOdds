@@ -1,0 +1,25 @@
+VenueCode,VenueName,RiskClass,DriftResilience,PhysicsType,KeyConstraint,ThresholdCondition,AlgorithmAction,PhysicalReasoning
+1,桐生,B,Medium,Thermodynamic/Altitude,Altitude 115m (Torque Drop),Always,Motor 1 < 30% = Force Renormalize,標高115mによる気圧低下が酸素濃度を下げ出足を物理的に減衰。30%未満は出力不足として1号艇消去・再正規化。
+2,戸田,B,Low,Geometric/Narrow,"1M Width 37m, Swing 13m",Always,Max Course 1 Confidence 0.4; Target Course 3/4 Makuri/Makuri-Zashi,13mの振り幅がインの斜行を強制し、進入角鋭角化により理想的旋回半径が確保できない。
+3,江戸川,A,Low,Hydrodynamic/River,River Current vs Tide Conflict,Wave > 5cm or Current Conflict,Course 1 Confidence 0.0 (チルト+0.5以上かつA1級なら0.7に緩和); Local Skill Weight x2.0,波高5cm以上で艇底が叩かれ推力が抜ける（キャビテーション）。ただしチルト角と操縦技術により波の衝撃は部分的に相殺可能。
+4,平和島,B,Critical Low,Geometric/Aerodynamic,Building Wind / Reflected Wave,Always,Course 6 Speculation (Wind >= 4m/s Boost x2.0),護岸反射波が風速に関わらずバックストレッチの加速に寄与。追い風4m以上で6コースの浮上ベクトル超補助。
+5,多摩川,D,High,Linear/Static,"Static Water, Tree Shield",Exhibition Diff > 0.02s,Win Probability Boost for Top Motor,環境ノイズ極小。運動方程式が線形に働き、機力と技術の差がそのまま着順に反映される。
+6,浜名湖,D,High,Geometric/Wide,Max Water Area,Always,Extension Power x1.2; Allow Full Speed Turn,障害物がなく旋回半径制約がないため、遠心力を最大化した全速ターンが可能。
+7,蒲郡,D,High,Thermodynamic/Night,Night Race,Time > 18:00,Course 1 Acceleration Boost (Air Density),夜間の気温低下が空気密度を上げ、エンジンの充填効率ηを向上させる。
+8,常滑,D,High,Aerodynamic,Ise Bay Headwind,Wind >= 4m/s,Course 2 Wall Decay; Target Course 4 Makuri-Zashi,強い向かい風はスロー勢の初速を削ぐが、ダッシュ勢は助走距離でカバー可能。
+9,津,D,Medium,Aerodynamic,Suzuka Oroshi,Wind >= 5m/s,Course 1 Decay; Target Course 2/3 Sash,強風による波立ちがバウをリフトさせ、インのターン初動グリップを失わせる。
+10,三国,C,High,Geometric/Sanctuary,Max Width 62m,Course 1 A-Class,Makuri Success < 5%,62mのホーム幅はインに無限の旋回半径を与え、物理的に外から包むことを不可能にする。
+11,びわこ,A,Low,Hydro/Thermo,"Altitude 85m, Swell",Always,Output Correction + Swell Factor; Target Sash,淡水の低浮力とうねりの上下動がリンクし、ターンでの横滑りを誘発する。
+12,住之江,C,High,Hydrodynamic/Hard,Concrete Reflection,Ride Comfort 'Bad',Downgrade evaluation regardless of power,硬い護岸からの反射波が減衰せず、艇の跳ねを引き起こす。接地性が最優先。
+13,尼崎,C,High,Geometric,Linear 1M layout,Motor 1 & 4 > 35%,Mutual Destruction Threshold Relaxed (Course 5 Target x1.4),1Mの旋回半径拡大による低圧差し込みエリア発生。ベクトル衝突時の5号艇浮上を補正。
+14,鳴門,A,Low,Hydrodynamic/Current,"Fast Current, Short Pit",Following Tide (Ebb),Course 1 Drift & Course 2 Sash / Course 4 Vector Max,下げ潮の流速ベクトルがダッシュ艇の初速に加算されると同時に、インコースの横滑りを誘発し2コースの差し場を創出する。
+15,丸亀,A,Medium,Hydrodynamic/Tide,Tide Level Difference,Low Tide,Switch to Makuri Mode (Course 3/4 Up),干潮時は水位低下により抵抗が減少し、全速旋回の物理的制約が解除される。
+16,児島,A,Medium,Hydrodynamic/Tide,Ebb Tide Acceleration,Ebb Tide,Dash Start Exhibition Weight x1.5,引き潮の流れがダッシュ勢の助走に対し、実質的な抵抗減（下り坂効果）をもたらす。
+17,宮島,A,Medium,Aero/Hydro,"Tide 4m, Wind Block",High Tide + Tail Wind,Course 1 Lock (Block outer attacks),スタンド側の風が物理的な壁となり、外枠の攻撃ベクトルを遮断する。
+18,徳山,C,High,Geometric/Optimal,Optimal Layout,Exhibition Start Unstable,Course 1 Win Rate Exp Decay,物理的ノイズが排除されているが、起こしの安定性欠如時は信頼度を指数関数的に減少。
+19,下関,C,High,Thermo/Visual,"Night, LED, Sea water",Night,Pit Exit Z-Score Dominance,夜間の水温低下による粘性変化がグリップを向上させ、LEDが視覚的恐怖を取り除く。
+20,若松,C,High,Hydrodynamic/Closed,Closed Bay,Night,Course 1 Win Rate +15% Boost,夜間の空気密度上昇が充填効率を高め、インの初動トルクを増幅させ逃げを安定化。
+21,芦屋,C,High,Meta/Bias,Freshwater Low Viscosity,ST Diff > 0.03,Gate B Trigger,気圧変動と流体抵抗の相関によるオーバーシュート（フライング）誘発・系崩壊リスク。
+22,福岡,A,Low,Geo/Hydro,"Protruding 1M, Swell",Always,Course 3 Makuri Fail; Target Course 2 Sash,1Mの張り出しとうねりが、3コースの全速旋回ラインを幾何学的・流体的に消滅させる。
+23,唐津,D,High,Thermodynamic/Pit,Long Pit 178m,Long Wait,Acceleration Decay (Heat Sag),長い待機行動がエンジンの熱ダレを招き、出足トルクを低下させる。
+24,大村,C,High,Geometric/Sanctuary,Course 1 Protection,Wind < 6m/s,Course 1 Win Rate > 70%,幾何学的形状と出力制御がイン逃げを保護するように設計されている。
