@@ -289,11 +289,11 @@ def analyze(race_data, bankroll=1000):
             if f in k and s in k: prob_wide += v
         add_bet("拡連複", f"{f}={s}", prob_wide, "連複")
 
-    # 複勝 (Show) 1~3着に入る確率
+    # 複勝 (Show) 1~2着に入る確率
     for b in range(1, 7):
         prob_show = 0
         for k, v in harville_probs.items():
-            if b in k: prob_show += v
+            if b in k[:2]: prob_show += v
         add_bet("複勝", str(b), prob_show, "単勝/複勝")
 
     # 単勝 (Win) 1着になる確率
