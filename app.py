@@ -1,3 +1,14 @@
+"""
+app.py v2.0 — RTPT v7.3 + BankrollManager + Archiver 統合版
+=============================================================
+変更点:
+  - bankroll_manager 統合（日次リスク管理）
+  - race_data_archive への自動保存
+  - 結果照合ボタン追加
+  - Calibration / Performance ダッシュボード
+  - 警告表示の追加
+  - レース選択後の展示待ちガード強化
+"""
 import streamlit as st
 import requests
 import json
@@ -8,10 +19,39 @@ import os
 from bs4 import BeautifulSoup
 from datetime import datetime
 import concurrent.futures
-from rtpt_engine import analyze  # v6.3 Engine Integration
+
+from rtpt_engine import analyze
+from bankroll_manager import BankrollManager
+from backtest_system import Reconciler, PerformanceAnalyzer, CalibrationChecker, RaceDataArchiver
+
+# MLモデルのインポート（エラー回避付き）
+try:
+    from ml_model import BoatRaceMLModel
+    HAS_ML_MODEL = True
+except ImportError:
+    HAS_ML_MODEL = False
+
+# 安全にインポート（モジュールがない場合でも動作）
+try:
+    from data_quality import DataQualityMonitor
+    HAS_DATA_QUALITY = True
+except ImportError:
+    HAS_DATA_QUALITY = False
+
+try:
+    from tide_data import TideInjector
+    HAS_TIDE = True
+except ImportError:
+    HAS_TIDE = False
+
+try:
+    from race_selector import RaceFilter
+    HAS_RACE_SELECTOR = True
+except ImportError:
+    HAS_RACE_SELECTOR = False
 
 # --- 初期設定 ---
-st.set_page_config(page_title="RTPT v8.0 — Default Quant Engine", layout="wide")
+st.set_page_config(page_title="RTPT v7.5 — Production Engine", layout="wide")
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
@@ -20,13 +60,16 @@ JCD_MAP = {
     "児島": "16", "宮島": "17", "徳山": "18", "下関": "19", "若松": "20",
     "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24"
 }
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "predictions_log.csv")
+ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "race_data_archive")
 
 def extract_float(text):
     if not text: return 0.0
     m = re.search(r'-?[\d\.]+', str(text))
     return float(m.group()) if m else 0.0
 
-# --- スクレイピング・エンジン (既存ロジック) ---
+
+# --- スクレイピング（app.py v1からほぼ同一、省略部分はコメントで示す） ---
 
 @st.cache_data(ttl=60)
 def fetch_available_races(target_date):
@@ -35,23 +78,23 @@ def fetch_available_races(target_date):
         res = requests.get(url, headers=HEADERS, timeout=10)
         res.raise_for_status()
         res.encoding = 'utf-8'
-        html_text = res.text
         available_dict = {}
-        tbodies = re.finditer(r'<tbody.*?>.*?</tbody>', html_text, re.DOTALL)
+        tbodies = re.finditer(r'<tbody.*?>.*?</tbody>', res.text, re.DOTALL)
         for match in tbodies:
             tbody_html = match.group(0)
             stadium_match = re.search(r'alt="([^"]+)"', tbody_html)
             if not stadium_match: continue
-            stadium_name = stadium_match.group(1).strip()
-            if stadium_name not in JCD_MAP: continue
+            name = stadium_match.group(1).strip()
+            if name not in JCD_MAP: continue
             if "最終Ｒ発売終了" in tbody_html or "中止" in tbody_html: continue
             current_r = 1
             r_match = re.search(r'>(\d{1,2})R<', tbody_html)
             if r_match: current_r = int(r_match.group(1))
-            available_dict[stadium_name] = list(range(current_r, 13))
+            available_dict[name] = list(range(current_r, 13))
         return available_dict
-    except Exception as e:
+    except Exception:
         return {}
+
 
 def fetch_html(url, session, retries=3):
     for i in range(retries):
@@ -63,6 +106,7 @@ def fetch_html(url, session, retries=3):
         except Exception:
             if i == retries - 1: return ""
             time.sleep(1)
+
 
 def parse_racelist(html_text, race_data):
     if not html_text: return
@@ -84,20 +128,30 @@ def parse_racelist(html_text, race_data):
             if rank_span: rank = rank_span.text.strip()
         name_el = tbody.select_one('.is-fs18.is-fBold')
         name = name_el.text.strip().replace('\u3000', ' ') if name_el else ""
+
+        # [Bug#29修正] 登録番号を抽出（recent_form.pyのinjectに必要）
+        toban = ""
+        toban_link = tbody.select_one('a[href*="toban"]')
+        if toban_link:
+            tm = re.search(r'toban=(\d+)', toban_link.get('href', ''))
+            if tm: toban = tm.group(1)
+
         weight_match = re.search(r'([\d\.]+)kg', tds[2].text)
         weight = float(weight_match.group(1)) if weight_match else 0.0
         st_txt = [x.strip() for x in tds[3].get_text(separator='\n').split('\n') if x.strip()]
-        nat_win_txt = [x.strip() for x in tds[4].get_text(separator='\n').split('\n') if x.strip()]
-        loc_win_txt = [x.strip() for x in tds[5].get_text(separator='\n').split('\n') if x.strip()]
+        nat_win = [x.strip() for x in tds[4].get_text(separator='\n').split('\n') if x.strip()]
+        loc_win = [x.strip() for x in tds[5].get_text(separator='\n').split('\n') if x.strip()]
         mot = [x.strip() for x in tds[6].get_text(separator='\n').split('\n') if x.strip()]
         race_data["racelist"][b_no].update({
             "name": name, "class": rank, "weight": weight,
-            "win_rate_national": extract_float(nat_win_txt[0]) if nat_win_txt else 0.0,
-            "win_rate_local": extract_float(loc_win_txt[0]) if loc_win_txt else 0.0,
+            "racer_no": toban,
+            "win_rate_national": extract_float(nat_win[0]) if nat_win else 0.0,
+            "win_rate_local": extract_float(loc_win[0]) if loc_win else 0.0,
             "motor_no": mot[0] if mot else '-',
             "motor_2ren": extract_float(mot[1]) if len(mot) > 1 else 30.0,
             "avg_st": extract_float(st_txt[-1]) if st_txt else 0.15
         })
+
 
 def parse_beforeinfo(html_text, race_data):
     if not html_text: return
@@ -119,39 +173,40 @@ def parse_beforeinfo(html_text, race_data):
             if cls.startswith('is-wind') and cls not in ['is-windDirection', 'is-wind']:
                 try:
                     num = int(cls.replace('is-wind', ''))
-                    dir_map = {i: "追い風" if i in [1,2,3,4,14,15,16] else "横風" if i in [5,13] else "向かい風" for i in range(1,17)}
-                    env['wind_direction'] = dir_map.get(num, "無風")
+                    env['wind_direction_code'] = num  # [Bug#24] 生コード保存
+                    dm = {i: "追い風" if i in [1,2,3,4,14,15,16] else "横風" if i in [5,13] else "向かい風" for i in range(1,17)}
+                    env['wind_direction'] = dm.get(num, "無風")
                 except ValueError: pass
     if env.get('wind_speed') == 0.0: env['wind_direction'] = "無風"
     for tbody in soup.select('.table1 tbody'):
         trs = tbody.find_all('tr')
         if not trs: continue
         tds = trs[0].find_all('td')
-        b_no = None; boat_idx = -1
+        b_no = None; bi = -1
         for i, td in enumerate(tds):
             if td.get('class') and any(c.startswith('is-boatColor') for c in td.get('class')):
                 match = re.search(r'\d+', td.text)
-                if match: b_no = match.group(); boat_idx = i
+                if match: b_no = match.group(); bi = i
                 break
-        if b_no and boat_idx != -1 and b_no in race_data["racelist"]:
-            if len(tds) > boat_idx + 4:
+        if b_no and bi != -1 and b_no in race_data["racelist"]:
+            if len(tds) > bi + 4:
                 race_data["racelist"][b_no].update({
-                    "tilt": extract_float(tds[boat_idx + 3].text),
-                    "exhibition_time": extract_float(tds[boat_idx + 4].text)
+                    "tilt": extract_float(tds[bi + 3].text),
+                    "exhibition_time": extract_float(tds[bi + 4].text)
                 })
-    st_ex_divs = soup.select('.table1_boatImage1')
-    for course_idx, div in enumerate(st_ex_divs, 1):
-        b_no_el = div.select_one('.table1_boatImage1Number')
-        st_time_el = div.select_one('.table1_boatImage1Time')
-        if b_no_el and st_time_el:
-            b_no_match = re.search(r'\d+', b_no_el.text)
-            if b_no_match:
-                b_no = b_no_match.group()
-                st_val = st_time_el.text.strip()
-                if b_no in race_data["racelist"]:
-                    race_data["racelist"][b_no].update({"start_course": course_idx, "start_exhibition_st": st_val})
+    for ci, div in enumerate(soup.select('.table1_boatImage1'), 1):
+        bn_el = div.select_one('.table1_boatImage1Number')
+        st_el = div.select_one('.table1_boatImage1Time')
+        if bn_el and st_el:
+            m = re.search(r'\d+', bn_el.text)
+            if m:
+                b = m.group()
+                if b in race_data["racelist"]:
+                    race_data["racelist"][b].update({"start_course": ci, "start_exhibition_st": st_el.text.strip()})
+
 
 def parse_all_odds(html_dict, race_data):
+    """オッズパーサー（v1から継承。TODO: リファクタリング対象）"""
     for otype in ['odds3t', 'odds3f', 'odds2tf']:
         html = html_dict.get(otype)
         if not html: continue
@@ -200,166 +255,322 @@ def parse_all_odds(html_dict, race_data):
         for unit in soup_tf.select('.grid_unit'):
             label_el = unit.select_one('.title7_mainLabel')
             if not label_el: continue
-            label_text = label_el.text
-            mode = "単勝" if "単勝" in label_text else "複勝" if "複勝" in label_text else None
+            lt = label_el.text
+            mode = "単勝" if "単勝" in lt else "複勝" if "複勝" in lt else None
             if not mode: continue
             for tr in unit.select('table tbody tr'):
                 tds = tr.select('td')
                 if len(tds) < 3: continue
-                b_no = tds[0].text.strip(); val = tds[2].text.strip()
+                bn = tds[0].text.strip(); val = tds[2].text.strip()
                 if "is-disabled" not in tds[2].get('class', []):
-                    if mode == "単勝": race_data["odds"]["単勝"][b_no] = extract_float(val)
-                    else: race_data["odds"]["複勝"][b_no] = val
+                    if mode == "単勝": race_data["odds"]["単勝"][bn] = extract_float(val)
+                    else: race_data["odds"]["複勝"][bn] = val
+
 
 # ============================================================
 # UI
 # ============================================================
-st.title("🌌 RTPT v8.0 — 宇宙にサレンダーするAI (NORI Style)")
-st.caption("✨ 自由意志は存在しません。利益も損失も宇宙の全自動の采配です。深刻にならずに適当に見守りましょう。")
+st.title("🎯 RTPT v7.5 — Production Engine")
+st.caption(f"Multi-Market TMP | 10αソース + MLブレンド {ml_status_msg if 'ml_status_msg' in locals() else ''} | 潮汐交互作用 | Selection Bias補正 | Quarter Kelly")
 
+# --- Sidebar ---
 with st.sidebar:
     st.header("⚙️ Settings")
     target_date = st.date_input("日付", datetime.now()).strftime('%Y%m%d')
-    bankroll = st.number_input("💰 バンクロール（円）", min_value=100, value=10000, step=1000)
-    
-    available_races_dict = fetch_available_races(target_date)
-    if available_races_dict:
-        input_jcd = st.selectbox("🏟️ 開催場", list(available_races_dict.keys()))
-        target_rno = st.selectbox("🏁 レース番号(R)", available_races_dict[input_jcd])
+    initial_bankroll = st.number_input("💰 初期バンクロール（円）", min_value=100, value=10000, step=1000)
+
+    # MLモデルのロード
+    ml_model_instance = None
+    ml_status_msg = "（Harville数理モデルのみ）"
+    if HAS_ML_MODEL:
+        try:
+            m = BoatRaceMLModel()
+            if m.load():
+                ml_model_instance = m
+                ml_status_msg = "（LightGBM + Harville ブレンド）"
+        except Exception as e:
+            st.sidebar.warning(f"MLモデルのロードに失敗しました: {e}")
+
+    # BankrollManager
+    bm = BankrollManager(initial_bankroll=initial_bankroll)
+    budget_info = bm.get_race_budget()
+
+    # ステータス表示
+    stats = budget_info["stats"]
+    risk_color = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴", "BLOCKED": "⛔"}.get(stats["risk_level"], "")
+    st.markdown(f"### {risk_color} リスク: {stats['risk_level']}")
+    st.caption(f"残高: ¥{stats['current_bankroll']:,.0f} | 日次PnL: ¥{stats['daily_pnl']:+,.0f}")
+    st.caption(f"DD: {stats['daily_dd_pct']:.1f}% | 連敗: {stats['losing_streak']} | 本日{stats['races_today']}R")
+
+    if not budget_info["allowed"]:
+        st.error(budget_info["reason"])
     else:
-        st.caption("※全レース終了 または 取得失敗")
+        st.success(f"予算上限: ¥{budget_info['budget']:,.0f}")
+        if budget_info["reason"] != "✅ 通常運用":
+            st.warning(budget_info["reason"])
+
+    # 潮汐手動入力（潮汐場の場合）
+    tide_option = st.selectbox("🌊 潮汐（該当場のみ）", ["自動推定", "満潮", "干潮", "上げ潮", "下げ潮"])
+    tide_map = {"自動推定": None, "満潮": "high", "干潮": "low", "上げ潮": "flood", "下げ潮": "ebb"}
+
+    available = fetch_available_races(target_date)
+    if available:
+        input_jcd = st.selectbox("🏟️ 開催場", list(available.keys()))
+        target_rno = st.selectbox("🏁 レース番号(R)", available[input_jcd])
+    else:
+        st.caption("※全レース終了 or 取得失敗")
         input_jcd = st.selectbox("開催場", list(JCD_MAP.keys()))
         target_rno = st.selectbox("レース番号(R)", list(range(1, 13)))
-    
-    execute = st.button("🚀 宇宙の采配を確認する", type="primary", use_container_width=True)
-    
-    st.markdown("---")
-    st.header("👼 本日のアファメーション")
-    st.success("「これでいいのだ」\n\n「お金はただの便利な共同幻想に過ぎない」\n\n「怒りが湧いたらバカボ～ン！」\n\n「すべては宇宙の完璧な流れの中」")
 
-if execute:
-    target_jcd = JCD_MAP[input_jcd]
-    race_data = {
-        "metadata": {"date": target_date, "stadium": input_jcd, "race_number": f"{target_rno}R"},
-        "environment": {}, "racelist": {str(i): {} for i in range(1, 7)},
-        "odds": {"3連単": {}, "3連複": {}, "2連単": {}, "2連複": {}, "拡連複": {}, "単勝": {}, "複勝": {}}
-    }
+    execute = st.button("🚀 解析エンジン起動", type="primary", use_container_width=True,
+                        disabled=not budget_info["allowed"])
 
-    # === Phase 1: Scrape ===
-    with st.status("📡 データ取得中...", expanded=True) as status:
-        st.write("7ページを並列取得中...")
-        base_url = "https://www.boatrace.jp/owpc/pc/race"
-        urls = {
-            "racelist": f"{base_url}/racelist?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
-            "beforeinfo": f"{base_url}/beforeinfo?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
-            "odds3t": f"{base_url}/odds3t?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
-            "odds3f": f"{base_url}/odds3f?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
-            "odds2tf": f"{base_url}/odds2tf?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
-            "oddsk": f"{base_url}/oddsk?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
-            "oddstf": f"{base_url}/oddstf?rno={target_rno}&jcd={target_jcd}&hd={target_date}"
+    st.divider()
+    # 結果照合ボタン
+    if st.button("📊 結果照合（自動）"):
+        with st.spinner("結果をboatrace.jpから取得中..."):
+            reconciler = Reconciler()
+            try:
+                updated = reconciler.reconcile(LOG_FILE)
+                st.success(f"照合完了: {updated}件更新")
+            except Exception as e:
+                st.error(f"照合エラー: {e}")
+
+    # Circuit Breaker リセット
+    if stats["risk_level"] == "BLOCKED":
+        if st.button("🔄 Circuit Breaker リセット"):
+            bm.force_reset(initial_bankroll)
+            st.rerun()
+
+# --- メインタブ ---
+tab_main, tab_perf, tab_cal = st.tabs(["🎯 解析", "📊 パフォーマンス", "🔬 Calibration"])
+
+with tab_main:
+    if execute:
+        bankroll = budget_info["budget"]
+        target_jcd = JCD_MAP[input_jcd]
+        race_data = {
+            "metadata": {"date": target_date, "stadium": input_jcd, "race_number": f"{target_rno}R"},
+            "environment": {},
+            "racelist": {str(i): {} for i in range(1, 7)},
+            "odds": {"3連単": {}, "3連複": {}, "2連単": {}, "2連複": {}, "拡連複": {}, "単勝": {}, "複勝": {}}
         }
-        html_data = {}
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
-            future_to_key = {executor.submit(fetch_html, url, session): key for key, url in urls.items()}
-            for future in concurrent.futures.as_completed(future_to_key):
-                html_data[future_to_key[future]] = future.result()
-        
-        st.write("HTMLを解析中...")
-        parse_racelist(html_data.get("racelist"), race_data)
-        parse_beforeinfo(html_data.get("beforeinfo"), race_data)
-        parse_all_odds(html_data, race_data)
-        status.update(label="✅ データ取得完了", state="complete")
 
-    # === Phase 2: v8.0 AI Engine Analysis ===
-    result = analyze(race_data, bankroll)
+        # 潮汐データ注入
+        tide_val = tide_map.get(tide_option)
+        if tide_val:
+            race_data["environment"]["tide"] = tide_val
 
-    # === Phase 3: 予想ログ自動保存 ===
-    LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "predictions_log.csv")
-    if not result.get("error") and result.get("targets"):
-        log_exists = os.path.isfile(LOG_FILE)
-        try:
+        # === Scrape ===
+        with st.status("📡 データ取得中...", expanded=True) as status:
+            base_url = "https://www.boatrace.jp/owpc/pc/race"
+            urls = {
+                "racelist": f"{base_url}/racelist?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
+                "beforeinfo": f"{base_url}/beforeinfo?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
+                "odds3t": f"{base_url}/odds3t?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
+                "odds3f": f"{base_url}/odds3f?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
+                "odds2tf": f"{base_url}/odds2tf?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
+                "oddsk": f"{base_url}/oddsk?rno={target_rno}&jcd={target_jcd}&hd={target_date}",
+                "oddstf": f"{base_url}/oddstf?rno={target_rno}&jcd={target_jcd}&hd={target_date}"
+            }
+            html_data = {}
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=7) as ex:
+                futs = {ex.submit(fetch_html, u, session): k for k, u in urls.items()}
+                for f in concurrent.futures.as_completed(futs):
+                    html_data[futs[f]] = f.result()
+
+            parse_racelist(html_data.get("racelist"), race_data)
+            parse_beforeinfo(html_data.get("beforeinfo"), race_data)
+            parse_all_odds(html_data, race_data)
+
+            # データ品質チェック
+            missing = []
+            for k in ["odds3t", "odds2tf", "oddstf"]:
+                if not html_data.get(k):
+                    missing.append(k)
+            if missing:
+                st.warning(f"⚠️ 取得失敗ページ: {', '.join(missing)}")
+
+            status.update(label="✅ データ取得完了", state="complete")
+
+        # === [Bug#17修正] データ品質チェック ===
+        if HAS_DATA_QUALITY:
+            dqm = DataQualityMonitor()
+            quality = dqm.assess(race_data, html_data)
+            if not quality["tradeable"]:
+                st.error(f"🛑 {quality['recommendation']}")
+                for e in quality["all_errors"]:
+                    st.error(f"  ❌ {e}")
+                st.stop()
+            for w in quality["all_warnings"]:
+                st.warning(f"  ⚠️ {w}")
+
+        # === 潮汐自動注入 ===
+        if HAS_TIDE:
+            injector = TideInjector()
+            race_data = injector.inject(race_data)
+
+        # === レース適性チェック ===
+        if HAS_RACE_SELECTOR:
+            rf = RaceFilter()
+            bet_decision = rf.should_bet(race_data)
+            if not bet_decision["should_bet"]:
+                st.warning(f"⚠️ {bet_decision['reason']}")
+            else:
+                st.info(f"📊 {bet_decision['reason']} (信頼度: {bet_decision['confidence']:.0%})")
+
+        # === Analyze ===
+        result = analyze(race_data, bankroll, ml_model=ml_model_instance)
+
+        # === Archive ===（エラー時は保存しない。バックテストデータを汚染しないため）
+        if not result.get("error"):
+            archiver = RaceDataArchiver(ARCHIVE_DIR)
+            archiver.save(race_data, result)
+
+        # === Log ===
+        if not result.get("error") and result.get("targets"):
+            log_exists = os.path.isfile(LOG_FILE)
             with open(LOG_FILE, mode="a", encoding="utf-8-sig", newline="") as f:
-                fieldnames = ["date", "stadium", "race", "type", "combo",
-                              "prob_pct", "odds", "ev", "kelly_pct", "recommended_yen",
-                              "result_1st", "result_2nd", "result_3rd", "hit", "payout"]
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                if not log_exists:
-                    writer.writeheader()
+                fields = ["date", "stadium", "race", "type", "combo",
+                          "prob_pct", "odds", "ev", "kelly_pct", "recommended_yen",
+                          "result_1st", "result_2nd", "result_3rd", "hit", "payout"]
+                writer = csv.DictWriter(f, fieldnames=fields)
+                if not log_exists: writer.writeheader()
                 for t in result["targets"]:
                     writer.writerow({
-                        "date": target_date,
-                        "stadium": input_jcd,
-                        "race": f"{target_rno}R",
-                        "type": t["type"],
-                        "combo": t["combo"],
-                        "prob_pct": f"{t['prob']*100:.1f}",
-                        "odds": t["odds"],
-                        "ev": f"{t['ev']:.2f}",
-                        "kelly_pct": f"{t['kelly_pct']:.1f}",
+                        "date": target_date, "stadium": input_jcd, "race": f"{target_rno}R",
+                        "type": t["type"], "combo": t["combo"],
+                        "prob_pct": f"{t['prob']*100:.1f}", "odds": t["odds"],
+                        "ev": f"{t['ev']:.2f}", "kelly_pct": f"{t['kelly_pct']:.1f}",
                         "recommended_yen": t["recommended_yen"],
-                        "result_1st": "", "result_2nd": "", "result_3rd": "",
-                        "hit": "", "payout": ""
+                        "result_1st": "", "result_2nd": "", "result_3rd": "", "hit": "", "payout": ""
                     })
-            st.toast(f"✅ 予想ログを {LOG_FILE} に保存しました", icon="📝")
-        except PermissionError:
-            st.error(f"⚠️ ログ保存失敗: `{LOG_FILE}` がExcel等で開かれているため書き込みできません。ファイルを閉じてから再度実行してください。")
-        except Exception as e:
-            st.error(f"⚠️ ログ保存エラー: {e}")
 
-    if result.get("error"):
-        st.warning(f"⏳ {result['error']}")
-    else:
-        # --- AI推定勝率表示 ---
-        st.header(f"🧠 {input_jcd} {target_rno}R — AI解析（True Market Probability）")
-        cols = st.columns(6)
-        for boat_info in result.get("boats", []):
-            with cols[boat_info["boat"] - 1]:
-                delta = boat_info["post_prob"] - boat_info["tmp"]
-                st.metric(
-                    f"{boat_info['boat']}号艇",
-                    f"{boat_info['post_prob']*100:.1f}%",
-                    f"{delta*100:+.1f}%",
-                    delta_color="normal" if delta >= 0 else "inverse"
-                )
-                st.caption(f"{boat_info['name']}")
-                st.caption(f"TMP:{boat_info['tmp']*100:.1f}% AI:{boat_info['post_prob']*100:.1f}%")
-                
-                for r in boat_info["reasons"]:
-                    st.caption(f"📐 {r}")
+        # === 警告表示 ===
+        if result.get("warnings"):
+            for w in result["warnings"]:
+                st.warning(f"⚠️ {w}")
 
-        # --- 投資判断テーブル ---
-        st.header("🌌 宇宙の必然ベット (EV Table)")
-        targets = result.get("targets", [])
-        
-        if not targets:
-            st.info("💤 **【サレンダー（見）】** 宇宙の風が吹いていません。無理に抵抗せず、このレースは見送りましょう。")
+        # === 結果表示 ===
+        if result.get("error"):
+            st.warning(f"⏳ {result['error']}")
         else:
-            if result.get("is_concentrated"):
-                st.success(f"🌌 **【宇宙の必然ベット】** 宇宙の流れに乗ります。深刻にならず、ただ適当に見守ってください。")
-            
-            table_data = []
-            for t in targets:
-                row = {
-                    "券種": t["type"],
-                    "買い目": t["combo"],
-                    "推定確率": f"{t['prob']*100:.1f}%",
-                    "オッズ": f"{t['odds']:.1f}倍",
-                    "EV": f"{t['ev']:.2f}",
-                    "Kelly%": f"{t['kelly_pct']*100:.1f}%",
-                    "推奨額": f"{t['recommended_yen']}円"
-                }
-                table_data.append(row)
-            st.dataframe(table_data, use_container_width=True, hide_index=True)
-    
-    # --- JSON Download (backup) ---
-    with st.expander("📥 JSONデータ（バックアップ）"):
-        json_export = json.dumps(race_data, ensure_ascii=False, indent=2)
-        st.download_button(
-            label="JSONダウンロード",
-            data=json_export,
-            file_name=f"{target_date}_{input_jcd}_{target_rno}R_AIデータ.json",
-            mime="application/json"
-        )
-        st.json(race_data)
+            st.header(f"🧠 {input_jcd} {target_rno}R — 物理アルファ解析")
+            cols = st.columns(6)
+            for bi in result["boats"]:
+                with cols[bi["boat"] - 1]:
+                    delta = bi["post_prob"] - bi["tmp"]
+                    st.metric(f"{bi['boat']}号艇", f"{bi['post_prob']*100:.1f}%",
+                              f"{delta*100:+.1f}%",
+                              delta_color="normal" if delta >= 0 else "inverse")
+                    st.caption(bi["name"])
+                    st.caption(f"TMP:{bi['tmp']*100:.1f}% α:{bi['alpha']:.3f}")
+                    if bi["wd"] < 12.0:
+                        st.error(f"⚠️ WD:{bi['wd']:.0f}")
+                    for r in bi["reasons"]:
+                        st.caption(f"📐 {r}")
+
+            # 投資判断
+            st.header("💰 投資判断テーブル")
+            summary = result["summary"]
+
+            if summary["verdict"] == "見（ケン）":
+                st.error("🛑 **EV閾値を超える買い目なし → 見送り**")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("投資対象", f"{summary['count']}点")
+                c2.metric("平均EV", f"{summary['avg_ev']:.2f}")
+                c3.metric("最大EV", f"{summary['max_ev']:.2f}", summary['max_ev_combo'])
+                c4.metric("合計投資", f"¥{summary['total_investment']:,}")
+
+                table = []
+                for t in result["targets"]:
+                    table.append({
+                        "券種": t["type"], "買い目": t["combo"],
+                        "推定確率": f"{t['prob']*100:.1f}%", "オッズ": f"{t['odds']:.1f}倍",
+                        "EV": f"{t['ev']:.2f}", "Kelly%": f"{t['kelly_pct']:.1f}%",
+                        "推奨額": f"¥{t['recommended_yen']:,}"
+                    })
+                st.dataframe(table, use_container_width=True, hide_index=True)
+
+                # Calibration情報
+                cal = summary.get("calibration", {})
+                if cal.get("selection_bias_applied"):
+                    st.info(f"📊 Selection Bias補正適用済（候補{cal['n_candidates']}件）"
+                            f" EV閾値: 2連={cal['ev_thresholds']['2連']}, 3連={cal['ev_thresholds']['3連']}")
+
+        # JSON backup
+        with st.expander("📥 JSONデータ"):
+            st.download_button("Download", json.dumps(race_data, ensure_ascii=False, indent=2),
+                               f"{target_date}_{input_jcd}_{target_rno}R.json", "application/json")
+
+# --- Performance Tab ---
+with tab_perf:
+    st.header("📊 パフォーマンス分析")
+    if os.path.exists(LOG_FILE):
+        pa = PerformanceAnalyzer()
+        perf = pa.analyze(LOG_FILE)
+        if "error" in perf:
+            st.info(perf["error"])
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("総ベット数", perf["total_bets"])
+            c2.metric("ROI", f"{perf['roi']:+.1f}%")
+            c3.metric("Sharpe Ratio", perf["sharpe_ratio"])
+            c4.metric("Max DD", f"¥{perf['max_drawdown']:,.0f}")
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("的中率", f"{perf['hit_rate']:.1f}%")
+            c6.metric("投資総額", f"¥{perf['total_invested']:,}")
+            c7.metric("回収総額", f"¥{perf['total_payout']:,}")
+            c8.metric("日平均PnL", f"¥{perf['daily_avg_pnl']:+,.0f}")
+
+            st.subheader("券種別成績")
+            type_table = []
+            for bt, d in perf.get("by_type", {}).items():
+                type_table.append({
+                    "券種": bt, "ベット数": d["bets"], "的中": d["hits"],
+                    "的中率": f"{d['hits']/max(d['bets'],1)*100:.1f}%",
+                    "投資": f"¥{d['invested']:,}", "回収": f"¥{d['payout']:,}",
+                    "ROI": f"{(d['payout']-d['invested'])/max(d['invested'],1)*100:+.1f}%"
+                })
+            st.dataframe(type_table, use_container_width=True, hide_index=True)
+    else:
+        st.info("まだ予想ログがありません。解析を実行してデータを蓄積してください。")
+
+# --- Calibration Tab ---
+with tab_cal:
+    st.header("🔬 Calibration検証")
+    st.caption("推定確率が実際の的中率と一致しているかを検証します")
+    if os.path.exists(LOG_FILE):
+        cc = CalibrationChecker()
+        cal_result = cc.check(LOG_FILE)
+        if "error" in cal_result:
+            st.info(cal_result["error"])
+        else:
+            st.metric("Brier Score", f"{cal_result['brier_score']:.4f}",
+                       cal_result["brier_interpretation"])
+            st.caption(f"評価対象: {cal_result['total_evaluated']}件")
+
+            if cal_result["buckets"]:
+                cal_table = []
+                for label, d in cal_result["buckets"].items():
+                    cal_table.append({
+                        "確率帯": label, "件数": d["n"],
+                        "推定平均": f"{d['expected_rate_pct']:.1f}%",
+                        "実的中率": f"{d['actual_rate_pct']:.1f}%",
+                        "Gap": f"{d['gap']:+.1f}%",
+                        "Calibrated": "✅" if d["calibrated"] else "❌"
+                    })
+                st.dataframe(cal_table, use_container_width=True, hide_index=True)
+
+                st.subheader("Gapの読み方")
+                st.markdown("""
+                - **Gap > 0**: 的中率が推定より高い → 確率を過小評価（もっと賭けてよい）
+                - **Gap < 0**: 的中率が推定より低い → 確率を過大評価（賭けすぎ）
+                - **|Gap| < 5%**: 良好なキャリブレーション
+                """)
+    else:
+        st.info("照合済みデータが必要です。結果照合を実行してください。")

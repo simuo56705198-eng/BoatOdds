@@ -1,8 +1,13 @@
-streamlit==1.24.0
-requests==2.31.0
-beautifulsoup4==4.12.2
-pandas==2.2.3
-numpy==1.26.4
-lightgbm==4.5.0
-scikit-learn==1.6.1
-joblib==1.4.2
+# === Core ===
+streamlit>=1.30.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+pandas>=1.5.0
+
+# === Note ===
+# pandas は dashboard.py が直接 import するため明示的に指定。
+# streamlit の依存として自動インストールされるが、明示が安全。
+#
+# === 開発時のみ（テスト実行） ===
+# pip install pytest pytest-cov
